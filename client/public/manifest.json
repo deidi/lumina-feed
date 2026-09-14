@@ -1,0 +1,37 @@
+{
+  "name": "LuminaFeed — Memories Shared",
+  "short_name": "LuminaFeed",
+  "description": "Zero-backend real-time event photo sharing hub",
+  "start_url": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0b0f19",
+  "theme_color": "#0b0f19",
+  "icons": [
+    {
+      "src": "./icon.svg",
+      "sizes": "512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "./icon.svg",
+      "sizes": "192x192",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ],
+  "categories": ["photo", "social", "events"],
+  "shortcuts": [
+    {
+      "name": "Host Console",
+      "url": "./#/app",
+      "icons": [{ "src": "./icon.svg", "sizes": "192x192" }]
+    },
+    {
+      "name": "Live Showcase",
+      "url": "./#/",
+      "icons": [{ "src": "./icon.svg", "sizes": "192x192" }]
+    }
+  ]
+}
