@@ -946,12 +946,20 @@ export async function syncPhotosFromCloud(slug, { isHost = false } = {}) {
       return { success: false, added: 0, total: 0 };
     }
 
-    const event = await db.events.where('slug').equals(slug).first();
-    const eventKey = (event?.encryption_key || getStoredEventKey(slug) || '').trim();
-    if (event && !event.encryption_key && eventKey) {
-      await db.events.update(event.id, { encryption_key: eventKey, is_encrypted: true });
+    let event = await db.events.where('slug').equals(slug).first();
+    if (!event) {
+      try {
+        const manifest = await getEventManifestFromStorage(slug);
+        if (manifest) {
+          event = manifest;
+        }
+      } catch (_) {}
     }
-    const isModerated = event ? event.moderation_enabled !== false : true;
+    const eventKey = (event?.encryption_key || getStoredEventKey(slug) || '').trim();
+    if (event && !event.encryption_key && eventKey && event.id) {
+      await db.events.update(event.id, { encryption_key: eventKey, is_encrypted: true }).catch(() => {});
+    }
+    const isModerated = event ? event.moderation_enabled !== false : false;
 
     // Fetch list of host-approved paths from cloud manifest (if present)
     let cloudApprovedList = null;
@@ -990,7 +998,7 @@ export async function syncPhotosFromCloud(slug, { isHost = false } = {}) {
         // Photo exists locally. If URLs were missing, update them.
         const needsUrlUpdate = !match.storage_orig_url || !match.storage_thumb_url;
         // If the cloud explicitly marks this photo approved and locally it was still pending:
-        const shouldApproveFromCloud = cloudApprovedSet.has(cp.storage_orig_path) || cloudApprovedSet.has(cp.filename);
+        const shouldApproveFromCloud = cloudApprovedSet.has(cp.storage_orig_path) || cloudApprovedSet.has(cp.filename) || metadata?.status === 'approved' || !isModerated;
         const updates = {};
         
         if (needsUrlUpdate) {
@@ -1024,11 +1032,16 @@ export async function syncPhotosFromCloud(slug, { isHost = false } = {}) {
       } else {
         // NEW photo from remote device/network!
         // Determine status:
-        // 1. If explicitly in cloudApprovedSet -> 'approved'
+        // 1. If explicitly in cloudApprovedSet or metadata is approved -> 'approved'
         // 2. If auto-approve is active (!isModerated) -> 'approved'
         // 3. Otherwise, pending moderation review -> 'pending'
         let status = 'pending';
-        if (cloudApprovedSet.has(cp.storage_orig_path) || cloudApprovedSet.has(cp.filename) || !isModerated) {
+        if (
+          cloudApprovedSet.has(cp.storage_orig_path) ||
+          cloudApprovedSet.has(cp.filename) ||
+          metadata?.status === 'approved' ||
+          !isModerated
+        ) {
           status = 'approved';
         }
 

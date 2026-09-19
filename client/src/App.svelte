@@ -196,6 +196,11 @@
   let hostPhotoSyncTimer = null;
   let lastHostSyncTime = $state(null);
 
+  // Guest Cloud Sync State
+  let isGuestPhotoSyncing = $state(false);
+  let guestPhotoSyncTimer = null;
+  let lastGuestSyncTime = $state(null);
+
   // DOM file input references
   let cameraInputEl = $state();
   let fileInputEl = $state();
@@ -528,6 +533,7 @@
 
     try {
       if (isSlideshowRoute && currentEventSlug) {
+        stopGuestAutoSync();
         await loadSlideshowExperience(currentEventSlug);
         setupWebSocket(currentEventSlug, false);
       } else {
@@ -536,11 +542,15 @@
           await loadGuestExperience(currentEventSlug);
           setupWebSocket(currentEventSlug, false);
         } else if (isAppRoute) {
+          stopGuestAutoSync();
           await checkAuth();
         } else if (isSuperAdminRoute) {
+          stopGuestAutoSync();
           if (isSuperAdminAuthenticated) {
             await loadGlobalTracker();
           }
+        } else {
+          stopGuestAutoSync();
         }
       }
     } catch (err) {
@@ -680,11 +690,11 @@
         }
       }
     } else if (isGuestRoute) {
-      if (msg.type === "photo:approved") {
+      if (msg.type === "photo:approved" || (msg.type === "photo:uploaded" && msg.payload?.status === "approved")) {
         const photo = msg.payload;
         // 1. Update status in myUploads
         myUploads = myUploads.map((p) =>
-          ((p.hash && p.hash === photo.hash) || p.id === photo.id || p.filename === photo.filename)
+          ((p.hash && p.hash === photo.hash) || (p.storage_orig_path && p.storage_orig_path === photo.storage_orig_path) || p.id === photo.id || p.filename === photo.filename)
             ? { ...p, status: "approved" }
             : p,
         );
@@ -699,9 +709,9 @@
         }
 
         // 3. Find or construct the photo object with valid image URL
-        const localMatch = myUploads.find((p) => (p.hash && p.hash === photo.hash) || p.id === photo.id || p.filename === photo.filename);
-        const thumbUrl = photo.thumb_url || photo.drive_thumb_url || photo.original_url || photo.drive_orig_url || (localMatch ? localMatch.thumb_url : "");
-        const origUrl = photo.original_url || photo.drive_orig_url || thumbUrl || (localMatch ? localMatch.original_url : "");
+        const localMatch = myUploads.find((p) => (p.hash && p.hash === photo.hash) || (p.storage_orig_path && p.storage_orig_path === photo.storage_orig_path) || p.id === photo.id || p.filename === photo.filename);
+        const thumbUrl = photo.thumb_url || photo.storage_thumb_url || photo.drive_thumb_url || photo.original_url || photo.storage_orig_url || (localMatch ? localMatch.thumb_url : "");
+        const origUrl = photo.original_url || photo.storage_orig_url || photo.drive_orig_url || thumbUrl || (localMatch ? localMatch.original_url : "");
 
         let galleryItem = null;
         if (localMatch) {
@@ -720,13 +730,13 @@
         // 4. Update liveGalleryPhotos reactively
         if (
           !liveGalleryPhotos.some(
-            (p) => (p.hash && p.hash === photo.hash) || p.id === photo.id,
+            (p) => (p.hash && p.hash === photo.hash) || (p.storage_orig_path && p.storage_orig_path === photo.storage_orig_path) || p.id === photo.id,
           )
         ) {
           liveGalleryPhotos = [galleryItem, ...liveGalleryPhotos];
         } else {
           liveGalleryPhotos = liveGalleryPhotos.map((p) =>
-            ((p.hash && p.hash === photo.hash) || p.id === photo.id)
+            ((p.hash && p.hash === photo.hash) || (p.storage_orig_path && p.storage_orig_path === photo.storage_orig_path) || p.id === photo.id)
               ? { ...p, ...galleryItem, status: "approved" }
               : p,
           );
@@ -2344,6 +2354,9 @@
         }).catch((err) => console.warn("Guest cloud sync warning:", err));
       }
 
+      // Start automatic periodic cloud sync for live memories wall
+      startGuestAutoSync(slug);
+
       const existingToken = getGuestToken(slug);
       if (existingToken) {
         try {
@@ -2377,6 +2390,55 @@
     } catch (err) {
       console.error("loadGuestExperience error:", err);
       errorMsg = err.message || "Event space not found";
+    }
+  }
+
+  async function syncGuestPhotos(slug) {
+    if (!slug || isGuestPhotoSyncing) return;
+    if (!storage.isStorageConfigured()) return;
+
+    isGuestPhotoSyncing = true;
+    try {
+      const syncRes = await api.syncPhotosFromCloud(slug, { isHost: false });
+      if (syncRes && syncRes.success) {
+        const updatedGallery = await api.getPhotos(slug, { status: "approved" });
+        const currentFingerprint = liveGalleryPhotos
+          .map((p) => p.storage_orig_path || p.hash || p.id)
+          .join("|");
+        const newPhotos = updatedGallery.photos || [];
+        const newFingerprint = newPhotos
+          .map((p) => p.storage_orig_path || p.hash || p.id)
+          .join("|");
+
+        if (currentFingerprint !== newFingerprint) {
+          liveGalleryPhotos = newPhotos;
+          decryptPhotosList(newPhotos).then((p) => {
+            liveGalleryPhotos = p;
+          });
+        }
+      }
+      lastGuestSyncTime = new Date();
+    } catch (err) {
+      console.warn("Guest auto-sync error:", err);
+    } finally {
+      isGuestPhotoSyncing = false;
+    }
+  }
+
+  function startGuestAutoSync(slug) {
+    stopGuestAutoSync();
+    if (!slug) return;
+    guestPhotoSyncTimer = setInterval(() => {
+      if (isGuestRoute && guestEventData && guestEventData.slug === slug) {
+        syncGuestPhotos(slug);
+      }
+    }, 5000);
+  }
+
+  function stopGuestAutoSync() {
+    if (guestPhotoSyncTimer) {
+      clearInterval(guestPhotoSyncTimer);
+      guestPhotoSyncTimer = null;
     }
   }
 
@@ -2597,7 +2659,7 @@
                 }).catch(() => {});
 
                 if (wsHandle) {
-                  wsHandle.notifyPhotoUploaded({
+                  const photoPayload = {
                     origUrl: uploadRes.origUrl,
                     thumbUrl: uploadRes.thumbUrl,
                     origPath: uploadRes.origPath,
@@ -2610,7 +2672,23 @@
                     mimeType: res.processed.mimeType,
                     guest_name: guestSession.guest.name,
                     guest_token: guestSession.guest.token,
-                  });
+                    status: res.photo.status,
+                  };
+                  wsHandle.notifyPhotoUploaded(photoPayload);
+
+                  if (res.photo.status === "approved") {
+                    wsHandle.send({
+                      type: "photo:approved",
+                      payload: {
+                        ...photoPayload,
+                        id: res.photo.id,
+                        thumb_url: uploadRes.thumbUrl,
+                        original_url: uploadRes.origUrl,
+                        storage_thumb_url: uploadRes.thumbUrl,
+                        storage_orig_url: uploadRes.origUrl,
+                      },
+                    });
+                  }
                 }
                 cloudUploaded = true;
               }
@@ -2623,7 +2701,7 @@
               try {
                 uploadProgressText = `Delivering preview ${i + 1} of ${files.length} to Host Queue...`;
                 const thumbDataUrl = await blobToBase64(res.processed.thumbBlob);
-                wsHandle.notifyPhotoUploaded({
+                const fallbackPayload = {
                   origUrl: "",
                   thumbUrl: thumbDataUrl,
                   origPath: "",
@@ -2637,7 +2715,22 @@
                   guest_name: guestSession.guest.name,
                   guest_token: guestSession.guest.token,
                   thumbDataUrl,
-                });
+                  status: res.photo.status,
+                };
+                wsHandle.notifyPhotoUploaded(fallbackPayload);
+                if (res.photo.status === "approved") {
+                  wsHandle.send({
+                    type: "photo:approved",
+                    payload: {
+                      ...fallbackPayload,
+                      id: res.photo.id,
+                      thumb_url: thumbDataUrl,
+                      original_url: thumbDataUrl,
+                      storage_thumb_url: thumbDataUrl,
+                      storage_orig_url: thumbDataUrl,
+                    },
+                  });
+                }
               } catch (fallbackErr) {
                 console.error("Direct fallback transmission error:", fallbackErr);
               }
@@ -3034,6 +3127,7 @@
       window.removeEventListener("focus", handleVisibilityChange);
       if (slideshowTimer) clearInterval(slideshowTimer);
       stopHostAutoSync();
+      stopGuestAutoSync();
     };
   });
 
@@ -3046,6 +3140,7 @@
     }
     stopSlideshowAutoRefresh();
     stopHostAutoSync();
+    stopGuestAutoSync();
   });
 </script>
 

@@ -33,8 +33,12 @@ export function initRealtimeHub(slug, options = {}) {
       localChannel = new BroadcastChannel(`luminafeed_rt_${slug}`);
       localChannel.onmessage = async (event) => {
         if (event.data && !isDestroyed) {
-          if (event.data.type === 'local:photo-uploaded' && isHost) {
-            await handleIncomingCloudPhoto(event.data.payload);
+          if (event.data.type === 'local:photo-uploaded') {
+            if (isHost) {
+              await handleIncomingCloudPhoto(event.data.payload);
+            } else {
+              await handleIncomingGuestPhoto(event.data.payload);
+            }
           } else if (event.data.type === 'local:gallery-req' && isHost) {
             await broadcastApprovedGallery();
           } else {
@@ -112,9 +116,13 @@ export function initRealtimeHub(slug, options = {}) {
           }
         } else if (topic === topicGalleryReq && isHost) {
           await broadcastApprovedGallery();
-        } else if (topic === topicPhotos && isHost) {
+        } else if (topic === topicPhotos) {
           if (payload.photo) {
-            await handleIncomingCloudPhoto(payload.photo);
+            if (isHost) {
+              await handleIncomingCloudPhoto(payload.photo);
+            } else {
+              await handleIncomingGuestPhoto(payload.photo);
+            }
           }
         } else if (topic === topicJoins && isHost) {
           if (payload.guest) {
@@ -257,6 +265,95 @@ export function initRealtimeHub(slug, options = {}) {
       }
     } catch (err) {
       console.error('Failed to handle incoming cloud photo:', err);
+    }
+  }
+
+  async function handleIncomingGuestPhoto(photoData) {
+    if (isDestroyed || !photoData) return;
+    try {
+      const event = await db.events.where('slug').equals(slug).first();
+      const isModerated = event ? event.moderation_enabled !== false : false;
+      const isApproved = photoData.status === 'approved' || !isModerated;
+      if (!isApproved) return;
+
+      const {
+        origUrl,
+        thumbUrl,
+        origPath,
+        thumbPath,
+        filename,
+        hash,
+        width,
+        height,
+        size,
+        mimeType,
+        guest_name,
+        guest_token,
+        thumbDataUrl,
+      } = photoData;
+
+      const finalOrigUrl = origUrl || '';
+      const finalThumbUrl = thumbUrl || finalOrigUrl;
+      const now = new Date().toISOString();
+
+      if (hash) {
+        const existing = await db.photos.where('hash').equals(hash).first();
+        if (existing) {
+          if (existing.status !== 'approved') {
+            await db.photos.update(existing.id, { status: 'approved' });
+          }
+          onMessage({
+            type: 'photo:approved',
+            payload: {
+              ...existing,
+              status: 'approved',
+              storage_orig_url: finalOrigUrl || existing.storage_orig_url,
+              storage_thumb_url: finalThumbUrl || existing.storage_thumb_url,
+              thumb_url: finalThumbUrl || existing.thumb_url,
+              original_url: finalOrigUrl || existing.original_url,
+              thumbnail_path: finalThumbUrl || existing.thumbnail_path,
+              original_path: finalOrigUrl || existing.original_path,
+            },
+          });
+          return;
+        }
+      }
+
+      const photoRecord = {
+        event_slug: slug,
+        guest_name: guest_name || 'Guest',
+        guest_token: guest_token || null,
+        filename: filename || `photo_${Date.now()}.jpg`,
+        hash: hash || filename,
+        status: 'approved',
+        width: width || 2048,
+        height: height || 1536,
+        size: size || 0,
+        mime_type: mimeType || 'image/jpeg',
+        storage_orig_path: origPath || '',
+        storage_thumb_path: thumbPath || '',
+        storage_orig_url: finalOrigUrl,
+        storage_thumb_url: finalThumbUrl,
+        original_url: finalOrigUrl,
+        thumb_url: finalThumbUrl,
+        original_path: finalOrigUrl,
+        thumbnail_path: finalThumbUrl,
+        created_at: now,
+      };
+
+      const id = await db.photos.add(photoRecord);
+      const formattedPhoto = {
+        id,
+        ...photoRecord,
+        thumbDataUrl,
+      };
+
+      onMessage({
+        type: 'photo:approved',
+        payload: formattedPhoto,
+      });
+    } catch (err) {
+      console.warn('Failed to handle incoming guest photo:', err);
     }
   }
 
