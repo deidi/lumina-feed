@@ -130,10 +130,10 @@
     name: "",
     date: new Date().toISOString().split("T")[0],
     tagline: "",
-    moderation_enabled: true,
+    moderation_enabled: false,
     guest_upload_limit: 20,
-    exif_strip: false,
-    is_encrypted: true,
+    exif_strip: true,
+    is_encrypted: false,
   });
 
   // Host View: 'dashboard' | 'event_detail'
@@ -217,9 +217,19 @@
       if (photo.decrypted_orig_url) return photo.decrypted_orig_url;
       if (photo.original_blob) return db.getCachedObjectURL(photo.original_blob, `orig_${photo.id}`);
 
-      // If photo is encrypted, NEVER return raw .enc ciphertext URL to <img>!
-      const isEnc = Boolean(photo.is_encrypted || photo.filename?.includes(".enc") || photo.storage_thumb_url?.includes(".enc") || photo.thumb_url?.includes(".enc") || photo.storage_orig_url?.includes(".enc"));
-      if (isEnc) {
+      const rawThumbUrl = photo.storage_thumb_url || photo.thumb_url || photo.thumbnail_path || "";
+      const rawOrigUrl = photo.storage_orig_url || photo.original_url || photo.original_path || "";
+      const primaryUrl = rawThumbUrl || rawOrigUrl;
+
+      // Only treat as encrypted if the actual storage file path/URL is a .enc encrypted ciphertext blob
+      const isEncFile = Boolean(
+        (primaryUrl && primaryUrl.includes(".enc")) ||
+        (photo.filename && photo.filename.endsWith(".enc")) ||
+        (photo.storage_thumb_path && photo.storage_thumb_path.includes(".enc")) ||
+        (photo.storage_orig_path && photo.storage_orig_path.includes(".enc"))
+      );
+
+      if (isEncFile) {
         const key = currentEventSlug ? crypto.getStoredEventKey(currentEventSlug) : "";
         if (key && photo.id && !photo._isDecrypting) {
           photo._isDecrypting = true;
@@ -242,15 +252,7 @@
         return "";
       }
 
-      return (
-        photo.storage_thumb_url ||
-        photo.thumb_url ||
-        photo.thumbnail_path ||
-        photo.storage_orig_url ||
-        photo.original_url ||
-        photo.original_path ||
-        ""
-      );
+      return primaryUrl;
     }
 
     if (photo.decrypted_orig_url) return photo.decrypted_orig_url;
@@ -258,8 +260,17 @@
     if (photo.decrypted_thumb_url) return photo.decrypted_thumb_url;
     if (photo.thumb_blob) return db.getCachedObjectURL(photo.thumb_blob, `thumb_${photo.id}`);
 
-    const isEnc = Boolean(photo.is_encrypted || photo.filename?.includes(".enc") || photo.storage_orig_url?.includes(".enc") || photo.original_url?.includes(".enc"));
-    if (isEnc) {
+    const rawOrigUrl = photo.storage_orig_url || photo.original_url || photo.original_path || "";
+    const rawThumbUrl = photo.storage_thumb_url || photo.thumb_url || photo.thumbnail_path || "";
+    const primaryUrl = rawOrigUrl || rawThumbUrl;
+
+    const isEncFile = Boolean(
+      (primaryUrl && primaryUrl.includes(".enc")) ||
+      (photo.filename && photo.filename.endsWith(".enc")) ||
+      (photo.storage_orig_path && photo.storage_orig_path.includes(".enc"))
+    );
+
+    if (isEncFile) {
       const key = currentEventSlug ? crypto.getStoredEventKey(currentEventSlug) : "";
       if (key && !photo._isDecryptingOrig) {
         photo._isDecryptingOrig = true;
@@ -276,15 +287,7 @@
       return photo.decrypted_thumb_url || (photo.thumb_blob ? db.getCachedObjectURL(photo.thumb_blob, `thumb_${photo.id}`) : "");
     }
 
-    return (
-      photo.storage_orig_url ||
-      photo.original_url ||
-      photo.original_path ||
-      photo.storage_thumb_url ||
-      photo.thumb_url ||
-      photo.thumbnail_path ||
-      ""
-    );
+    return primaryUrl;
   }
 
   async function decryptPhotosList(photosList) {
@@ -301,7 +304,11 @@
           hasUpdates = true;
           return { ...p, decrypted_thumb_url: url };
         }
-        const isEnc = Boolean(p.is_encrypted || p.filename?.includes(".enc") || p.storage_thumb_url?.includes(".enc") || p.thumb_url?.includes(".enc"));
+        const isEnc = Boolean(
+          p.filename?.endsWith(".enc") ||
+          p.storage_thumb_path?.includes(".enc") ||
+          p.storage_orig_path?.includes(".enc")
+        );
         if (!isEnc) return p;
         try {
           const decrypted = await db.ensurePhotoDecrypted(p, key);
@@ -1358,10 +1365,10 @@
         name: "",
         date: new Date().toISOString().split("T")[0],
         tagline: "",
-        moderation_enabled: true,
+        moderation_enabled: false,
         guest_upload_limit: 20,
-        exif_strip: false,
-        is_encrypted: true,
+        exif_strip: true,
+        is_encrypted: false,
       };
       await loadEvents();
       if (res.event) {

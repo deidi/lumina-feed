@@ -286,10 +286,10 @@ export async function getEvent(slug) {
       host_name: manifest?.host_name || '',
       date: manifest?.date || new Date().toISOString().split('T')[0],
       tagline: manifest?.tagline || 'Memories Shared in Real-Time',
-      moderation_enabled: manifest ? manifest.moderation_enabled !== false : true,
+      moderation_enabled: Boolean(manifest?.moderation_enabled),
       guest_upload_limit: Number(manifest?.guest_upload_limit) || 20,
       max_photos: Number(manifest?.max_photos) || 100,
-      is_encrypted: manifest ? Boolean(manifest.is_encrypted) : Boolean(storedKey),
+      is_encrypted: Boolean(manifest?.is_encrypted),
       encryption_key: storedKey || '',
       status: manifest?.status || 'active',
       created_at: manifest?.created_at || new Date().toISOString()
@@ -353,7 +353,7 @@ export async function createEvent(data, hostName = '') {
   const slug = await getUniqueSlug(name);
   const now = new Date().toISOString();
 
-  const isEncrypted = data.is_encrypted !== false;
+  const isEncrypted = Boolean(data.is_encrypted);
   let encryptionKey = (data.encryption_key || '').trim();
   let adminWrappedKey = '';
 
@@ -373,7 +373,7 @@ export async function createEvent(data, hostName = '') {
     host_name: resolvedHost || 'Host',
     date: data.date || now.split('T')[0],
     tagline: data.tagline || '',
-    moderation_enabled: data.moderation_enabled !== false,
+    moderation_enabled: Boolean(data.moderation_enabled),
     guest_upload_limit: Math.min(100, Math.max(1, parseInt(data.guest_upload_limit, 10) || 20)),
     max_photos: 100,
     exif_strip: Boolean(data.exif_strip),
@@ -615,7 +615,7 @@ export async function getGuestSession(slug, guestToken) {
       name: formattedName,
       date: new Date().toISOString().split('T')[0],
       tagline: 'Memories Shared in Real-Time',
-      moderation_enabled: true,
+      moderation_enabled: false,
       guest_upload_limit: 20,
       max_photos: 100,
       status: 'active',
@@ -718,7 +718,7 @@ export async function uploadPhoto(slug, file, guestToken) {
     throw new Error('This photo has already been uploaded to this event.');
   }
 
-  const initialStatus = (!event.moderation_enabled || isHost) ? 'approved' : 'pending';
+  const initialStatus = (!event || !event.moderation_enabled || isHost) ? 'approved' : 'pending';
   const now = new Date().toISOString();
 
   const photoRecord = {

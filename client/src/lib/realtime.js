@@ -272,7 +272,7 @@ export function initRealtimeHub(slug, options = {}) {
     if (isDestroyed || !photoData) return;
     try {
       const event = await db.events.where('slug').equals(slug).first();
-      const isModerated = event ? event.moderation_enabled !== false : false;
+      const isModerated = Boolean(event?.moderation_enabled);
       const isApproved = photoData.status === 'approved' || !isModerated;
       if (!isApproved) return;
 
