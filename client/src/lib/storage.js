@@ -561,7 +561,9 @@ function extractStoragePath(urlOrPath, bucket) {
 export async function uploadPhotoToStorage({
   eventSlug,
   fileName,
+  filename,
   origBlob,
+  originalBlob,
   thumbBlob,
   mimeType = 'image/jpeg',
   encryptionKey = '',
@@ -591,24 +593,30 @@ export async function uploadPhotoToStorage({
   const { bucket } = getBaaSConfig();
 
   const safeSlug = (eventSlug || 'default').replace(/[^a-zA-Z0-9-_]/g, '_');
-  const safeName = (fileName || `photo_${Date.now()}.jpg`).replace(/[^a-zA-Z0-9-_\.]/g, '_');
+  const rawFileName = fileName || filename || `photo_${Date.now()}.jpg`;
+  const safeName = rawFileName.replace(/[^a-zA-Z0-9-_\.]/g, '_');
   const timestamp = Date.now();
   const rand = generateSecureToken();
 
   const key = (encryptionKey || getStoredEventKey(eventSlug) || '').trim();
   const isEncrypted = Boolean(key);
 
-  let finalOrigBlob = origBlob;
-  let finalThumbBlob = thumbBlob;
+  let rawOrigBlob = origBlob || originalBlob;
+  let rawThumbBlob = thumbBlob;
 
-  if (isEncrypted) {
+  let finalOrigBlob = rawOrigBlob;
+  let finalThumbBlob = rawThumbBlob;
+
+  if (isEncrypted && rawOrigBlob) {
     try {
-      finalOrigBlob = await encryptBlob(origBlob, key);
-      finalThumbBlob = await encryptBlob(thumbBlob, key);
+      finalOrigBlob = await encryptBlob(rawOrigBlob, key);
+      if (rawThumbBlob) {
+        finalThumbBlob = await encryptBlob(rawThumbBlob, key);
+      }
     } catch (encErr) {
       console.warn('Client-side photo encryption failed, falling back to unencrypted:', encErr);
-      finalOrigBlob = origBlob;
-      finalThumbBlob = thumbBlob;
+      finalOrigBlob = rawOrigBlob;
+      finalThumbBlob = rawThumbBlob;
     }
   }
 
@@ -1327,7 +1335,9 @@ export async function createCloudEvent(eventData, hostName) {
       date: eventData.date || new Date().toISOString().split('T')[0],
       moderation_enabled: eventData.moderation_enabled !== false,
       auto_approve: Boolean(eventData.auto_approve),
-      e2ee_enabled: Boolean(eventData.e2ee_enabled),
+      e2ee_enabled: Boolean(eventData.e2ee_enabled || eventData.is_encrypted),
+      is_encrypted: Boolean(eventData.is_encrypted || eventData.e2ee_enabled),
+      encryption_key: eventData.encryption_key || '',
       allow_guest_downloads: eventData.allow_guest_downloads !== false,
       frame_url: eventData.frame_url || null,
       frame_config: eventData.frame_config || { enabled: false, preset: 'none', text: '' },
@@ -1550,6 +1560,7 @@ export async function syncPhotoToCloud(photoData) {
       has_frame: Boolean(photoData.has_frame),
       likes_count: Number(photoData.likes_count) || 0,
       status: photoData.status || 'pending',
+      is_encrypted: Boolean(photoData.is_encrypted || photoData.filename?.includes('.enc') || photoData.storage_orig_path?.includes('.enc')),
       width: Number(photoData.width) || null,
       height: Number(photoData.height) || null,
       size: Number(photoData.size) || null,

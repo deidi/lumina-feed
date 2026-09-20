@@ -412,8 +412,17 @@ export async function getEvents(hostName = '') {
       eventGuests.forEach(g => { if (g.name) guestNamesSet.add(g.name.trim().toLowerCase()); });
       const total_guests = Math.max(eventGuests.length, guestNamesSet.size);
 
+      const storedKey = getStoredEventKey(e.slug) || e.encryption_key || '';
+      if (storedKey && !getStoredEventKey(e.slug)) {
+        setStoredEventKey(e.slug, storedKey);
+      }
+      const isEncrypted = Boolean(e.is_encrypted || e.e2ee_enabled || storedKey);
+
       return {
         ...e,
+        is_encrypted: isEncrypted,
+        e2ee_enabled: isEncrypted,
+        encryption_key: storedKey,
         status: e.status || 'active',
         max_photos: Number(e.max_photos) || 100,
         total_photos: eventPhotos.length,

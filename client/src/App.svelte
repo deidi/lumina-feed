@@ -1260,6 +1260,13 @@
       const res = await api.getEvents(currentHost);
       events = res.events || [];
 
+      if (selectedEvent && selectedEvent.slug) {
+        const currentUpdated = events.find((e) => e.slug === selectedEvent.slug);
+        if (currentUpdated) {
+          selectedEvent = { ...selectedEvent, ...currentUpdated };
+        }
+      }
+
       // 24-Hour Ephemeral Retention: Clean up expired events/hosts & update countdown
       storage.cleanupExpiredHostsAndEvents().catch(() => {});
       updateHostExpirationTimer();
@@ -6288,40 +6295,44 @@
                 </div>
 
                 <div class="checkbox-row" style="background: rgba(59, 130, 246, 0.05); padding: 0.75rem; border-radius: var(--radius-sm); border: 1px solid rgba(59, 130, 246, 0.2); margin-top: 0.5rem;">
-                  <div style="display: flex; flex-direction: column; gap: 0.25rem; width: 100%;">
-                    <div style="display: flex; justify-content: space-between; align-items: center;">
-                      <strong>🔒 End-to-End Photo Encryption</strong>
-                      <span class="badge" style="background: {selectedEvent.is_encrypted ? 'rgba(16, 185, 129, 0.15)' : 'rgba(148, 163, 184, 0.15)'}; color: {selectedEvent.is_encrypted ? '#34d399' : '#94a3b8'}; border: 1px solid {selectedEvent.is_encrypted ? 'rgba(16, 185, 129, 0.3)' : 'rgba(148, 163, 184, 0.3)'}; font-size: 0.75rem; padding: 2px 8px; border-radius: 4px;">
-                        {selectedEvent.is_encrypted ? "Active" : "Disabled"}
-                      </span>
-                    </div>
-                    <span class="helper-text" style="font-size: 0.8125rem;">
-                      {selectedEvent.is_encrypted
-                        ? "Original photos and thumbnails are encrypted with AES-256-GCM. The decryption key is embedded in event QR codes."
-                        : "Photos for this event are uploaded in standard web format."}
-                    </span>
-                    {#if selectedEvent.is_encrypted && selectedEvent.encryption_key}
-                      <div style="margin-top: 0.5rem; display: flex; gap: 0.5rem; align-items: center;">
-                        <input
-                          type="password"
-                          readonly
-                          value={selectedEvent.encryption_key}
-                          style="font-family: monospace; font-size: 0.75rem; padding: 0.25rem 0.5rem; border-radius: 4px; border: 1px solid var(--color-border); background: var(--color-bg); color: var(--color-text); flex: 1;"
-                          id="eventKeyDisplay"
-                        />
-                        <button
-                          type="button"
-                          class="btn-secondary btn-sm"
-                          onclick={() => {
-                            navigator.clipboard.writeText(selectedEvent.encryption_key);
-                            alert("Event decryption key copied to clipboard!");
-                          }}
-                        >
-                          Copy Key
-                        </button>
+                  {#if selectedEvent}
+                    {@const isEventEncrypted = Boolean(selectedEvent.is_encrypted || selectedEvent.e2ee_enabled || selectedEvent.encryption_key || (selectedEvent.slug ? crypto.getStoredEventKey(selectedEvent.slug) : ''))}
+                    {@const eventKey = selectedEvent.encryption_key || (selectedEvent.slug ? crypto.getStoredEventKey(selectedEvent.slug) : '')}
+                    <div style="display: flex; flex-direction: column; gap: 0.25rem; width: 100%;">
+                      <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <strong>🔒 End-to-End Photo Encryption</strong>
+                        <span class="badge" style="background: {isEventEncrypted ? 'rgba(16, 185, 129, 0.15)' : 'rgba(148, 163, 184, 0.15)'}; color: {isEventEncrypted ? '#34d399' : '#94a3b8'}; border: 1px solid {isEventEncrypted ? 'rgba(16, 185, 129, 0.3)' : 'rgba(148, 163, 184, 0.3)'}; font-size: 0.75rem; padding: 2px 8px; border-radius: 4px;">
+                          {isEventEncrypted ? "Active" : "Disabled"}
+                        </span>
                       </div>
-                    {/if}
-                  </div>
+                      <span class="helper-text" style="font-size: 0.8125rem;">
+                        {isEventEncrypted
+                          ? "Original photos and thumbnails are encrypted with AES-256-GCM. The decryption key is embedded in event QR codes."
+                          : "Photos for this event are uploaded in standard web format."}
+                      </span>
+                      {#if isEventEncrypted && eventKey}
+                        <div style="margin-top: 0.5rem; display: flex; gap: 0.5rem; align-items: center;">
+                          <input
+                            type="password"
+                            readonly
+                            value={eventKey}
+                            style="font-family: monospace; font-size: 0.75rem; padding: 0.25rem 0.5rem; border-radius: 4px; border: 1px solid var(--color-border); background: var(--color-bg); color: var(--color-text); flex: 1;"
+                            id="eventKeyDisplay"
+                          />
+                          <button
+                            type="button"
+                            class="btn-secondary btn-sm"
+                            onclick={() => {
+                              navigator.clipboard.writeText(eventKey);
+                              alert("Event decryption key copied to clipboard!");
+                            }}
+                          >
+                            Copy Key
+                          </button>
+                        </div>
+                      {/if}
+                    </div>
+                  {/if}
                 </div>
 
                 <button
