@@ -279,13 +279,14 @@
 
   function isPhotoEncrypted(photo) {
     if (!photo) return false;
+    if (photo.is_encrypted === true || photo.encrypted === true) return true;
     const path = photo.storage_orig_path || photo.storage_thumb_path || photo.storage_orig_url || photo.storage_thumb_url || photo.original_url || photo.thumb_url || photo.filename || "";
     return Boolean(path.includes(".enc") || path.includes(".lenc"));
   }
 
   function triggerPhotosRefresh(photo) {
     if (!photo) return;
-    if (selectedPreviewPhoto && (selectedPreviewPhoto.id === photo.id || (photo.storage_orig_path && selectedPreviewPhoto.storage_orig_path === photo.storage_orig_path))) {
+    if (selectedPreviewPhoto && (selectedPreviewPhoto.id === photo.id || (photo.storage_orig_path && selectedPreviewPhoto.storage_orig_path === photo.storage_orig_path) || (photo.filename && selectedPreviewPhoto.filename === photo.filename))) {
       selectedPreviewPhoto = { ...selectedPreviewPhoto, ...photo };
     }
     if (isSlideshowRoute) {
@@ -299,22 +300,63 @@
     }
   }
 
+  function openPhotoPreview(photo) {
+    if (!photo) return;
+    selectedPreviewPhoto = photo;
+    if (isPhotoEncrypted(photo)) {
+      const key = resolveEventDecryptionKey(photo);
+      if (key) {
+        if (!photo.decrypted_orig_url && !photo.original_blob && !photo._isDecryptingOrig) {
+          photo._isDecryptingOrig = true;
+          db.getDecryptedOriginalBlob(photo, key)
+            .then((blob) => {
+              if (blob) {
+                const url = db.getCachedObjectURL(blob, `orig_${photo.id || photo.filename}`);
+                photo.decrypted_orig_url = url;
+                photo.original_blob = blob;
+                photo._isDecryptingOrig = false;
+                triggerPhotosRefresh(photo);
+              }
+            })
+            .catch((e) => {
+              console.warn("Could not decrypt full original for preview:", e);
+              photo._isDecryptingOrig = false;
+            });
+        }
+        if (!photo.decrypted_thumb_url && !photo.thumb_blob && !photo._isDecryptingThumb) {
+          photo._isDecryptingThumb = true;
+          db.ensurePhotoDecrypted(photo, key)
+            .then((res) => {
+              if (res && res.thumb_blob) {
+                const url = db.getCachedObjectURL(res.thumb_blob, `thumb_${photo.id || photo.filename}`);
+                photo.decrypted_thumb_url = url;
+                photo.thumb_blob = res.thumb_blob;
+                photo._isDecryptingThumb = false;
+                triggerPhotosRefresh(photo);
+              }
+            })
+            .catch(() => {
+              photo._isDecryptingThumb = false;
+            });
+        }
+      }
+    }
+  }
+
   function getPhotoSrc(photo, isThumb = true) {
     if (!photo) return "";
     if (typeof photo === "string") return photo;
 
+    const isEnc = isPhotoEncrypted(photo);
+
     if (isThumb) {
-      if (photo.decrypted_thumb_url) return photo.decrypted_thumb_url;
+      if (photo.decrypted_thumb_url && !photo.decrypted_thumb_url.includes(".lenc")) return photo.decrypted_thumb_url;
       if (photo.thumb_blob) return db.getCachedObjectURL(photo.thumb_blob, `thumb_${photo.id || photo.filename}`);
       if (photo.thumbDataUrl) return photo.thumbDataUrl;
-      if (photo.decrypted_orig_url) return photo.decrypted_orig_url;
+      if (photo.decrypted_orig_url && !photo.decrypted_orig_url.includes(".lenc")) return photo.decrypted_orig_url;
       if (photo.original_blob) return db.getCachedObjectURL(photo.original_blob, `orig_${photo.id || photo.filename}`);
 
-      const rawThumbUrl = photo.storage_thumb_url || photo.thumb_url || photo.thumbnail_path || "";
-      const rawOrigUrl = photo.storage_orig_url || photo.original_url || photo.original_path || "";
-      const primaryUrl = rawThumbUrl || rawOrigUrl;
-
-      if (isPhotoEncrypted(photo)) {
+      if (isEnc) {
         const key = resolveEventDecryptionKey(photo);
         if (key && !photo._isDecryptingThumb) {
           photo._isDecryptingThumb = true;
@@ -322,38 +364,45 @@
             if (res && res.thumb_blob) {
               const url = db.getCachedObjectURL(res.thumb_blob, `thumb_${photo.id || photo.filename}`);
               photo.decrypted_thumb_url = url;
+              photo.thumb_blob = res.thumb_blob;
+              photo._isDecryptingThumb = false;
               triggerPhotosRefresh(photo);
             }
-          }).catch(() => {});
+          }).catch(() => {
+            photo._isDecryptingThumb = false;
+          });
         }
         return "";
       }
 
-      return primaryUrl;
+      const rawThumbUrl = photo.storage_thumb_url || photo.thumb_url || photo.thumbnail_path || "";
+      const rawOrigUrl = photo.storage_orig_url || photo.original_url || photo.original_path || "";
+      return rawThumbUrl || rawOrigUrl;
     }
 
-    // Full resolution original
-    if (photo.decrypted_orig_url) return photo.decrypted_orig_url;
+    // --- Full resolution original (Photo Preview & Slideshow) ---
+    if (photo.decrypted_orig_url && !photo.decrypted_orig_url.includes(".lenc")) return photo.decrypted_orig_url;
     if (photo.original_blob) return db.getCachedObjectURL(photo.original_blob, `orig_${photo.id || photo.filename}`);
-    if (photo.decrypted_thumb_url) return photo.decrypted_thumb_url;
+    if (photo.decrypted_thumb_url && !photo.decrypted_thumb_url.includes(".lenc")) return photo.decrypted_thumb_url;
     if (photo.thumb_blob) return db.getCachedObjectURL(photo.thumb_blob, `thumb_${photo.id || photo.filename}`);
 
-    const rawOrigUrl = photo.storage_orig_url || photo.original_url || photo.original_path || "";
-    const rawThumbUrl = photo.storage_thumb_url || photo.thumb_url || photo.thumbnail_path || "";
-    const primaryUrl = rawOrigUrl || rawThumbUrl;
-
-    if (isPhotoEncrypted(photo)) {
+    if (isEnc) {
       const key = resolveEventDecryptionKey(photo);
       if (key) {
         if (!photo.decrypted_orig_url && !photo._isDecryptingOrig) {
           photo._isDecryptingOrig = true;
           db.getDecryptedOriginalBlob(photo, key).then((blob) => {
             if (blob) {
-              const url = URL.createObjectURL(blob);
+              const url = db.getCachedObjectURL(blob, `orig_${photo.id || photo.filename}`);
               photo.decrypted_orig_url = url;
+              photo.original_blob = blob;
+              photo._isDecryptingOrig = false;
               triggerPhotosRefresh(photo);
             }
-          }).catch(() => {});
+          }).catch((e) => {
+            console.warn("getDecryptedOriginalBlob error in getPhotoSrc:", e);
+            photo._isDecryptingOrig = false;
+          });
         }
         if (!photo.decrypted_thumb_url && !photo._isDecryptingThumb) {
           photo._isDecryptingThumb = true;
@@ -361,15 +410,23 @@
             if (res && res.thumb_blob) {
               const url = db.getCachedObjectURL(res.thumb_blob, `thumb_${photo.id || photo.filename}`);
               photo.decrypted_thumb_url = url;
+              photo.thumb_blob = res.thumb_blob;
+              photo._isDecryptingThumb = false;
               triggerPhotosRefresh(photo);
             }
-          }).catch(() => {});
+          }).catch(() => {
+            photo._isDecryptingThumb = false;
+          });
         }
       }
-      return photo.decrypted_thumb_url || (photo.thumb_blob ? db.getCachedObjectURL(photo.thumb_blob, `thumb_${photo.id || photo.filename}`) : "") || "";
+      // Return decrypted thumbnail if available while high-res original decrypts, or empty string so spinner displays
+      const validThumb = photo.decrypted_thumb_url && !photo.decrypted_thumb_url.includes(".lenc") ? photo.decrypted_thumb_url : "";
+      return validThumb || (photo.thumb_blob ? db.getCachedObjectURL(photo.thumb_blob, `thumb_${photo.id || photo.filename}`) : "") || "";
     }
 
-    return primaryUrl;
+    const rawOrigUrl = photo.storage_orig_url || photo.original_url || photo.original_path || "";
+    const rawThumbUrl = photo.storage_thumb_url || photo.thumb_url || photo.thumbnail_path || "";
+    return rawOrigUrl || rawThumbUrl;
   }
 
   async function decryptPhotosList(photosList) {
@@ -380,7 +437,7 @@
     let hasUpdates = false;
     const updated = await Promise.all(
       photosList.map(async (p) => {
-        if (p.decrypted_thumb_url) return p;
+        if (p.decrypted_thumb_url && !p.decrypted_thumb_url.includes(".lenc")) return p;
         if (p.thumb_blob) {
           const url = db.getCachedObjectURL(p.thumb_blob, `thumb_${p.id || p.filename}`);
           hasUpdates = true;
@@ -391,7 +448,8 @@
           const decrypted = await db.ensurePhotoDecrypted(p, key);
           if (decrypted && decrypted.thumb_blob) {
             hasUpdates = true;
-            return { ...p, ...decrypted, decrypted_thumb_url: decrypted.decrypted_thumb_url || decrypted.thumb_url };
+            const url = db.getCachedObjectURL(decrypted.thumb_blob, `thumb_${p.id || p.filename}`);
+            return { ...p, ...decrypted, decrypted_thumb_url: url, thumb_blob: decrypted.thumb_blob };
           }
         } catch (e) {
           console.warn("Thumbnail decryption error:", p.filename, e);
@@ -416,17 +474,23 @@
         p._isDecryptingOrig = true;
         db.getDecryptedOriginalBlob(p, key)
           .then((blob) => {
-            if (blob && selectedPreviewPhoto && (selectedPreviewPhoto.id === p.id || (p.storage_orig_path && selectedPreviewPhoto.storage_orig_path === p.storage_orig_path))) {
-              const url = URL.createObjectURL(blob);
-              selectedPreviewPhoto = { ...p, decrypted_orig_url: url };
+            if (blob && selectedPreviewPhoto && (selectedPreviewPhoto.id === p.id || (p.storage_orig_path && selectedPreviewPhoto.storage_orig_path === p.storage_orig_path) || (p.filename && selectedPreviewPhoto.filename === p.filename))) {
+              const url = db.getCachedObjectURL(blob, `orig_${p.id || p.filename}`);
+              p.decrypted_orig_url = url;
+              p.original_blob = blob;
+              p._isDecryptingOrig = false;
+              selectedPreviewPhoto = { ...p, decrypted_orig_url: url, original_blob: blob };
             }
           })
-          .catch((e) => console.warn("Could not decrypt full original for preview:", e));
+          .catch((e) => {
+            console.warn("Could not decrypt full original for preview:", e);
+            p._isDecryptingOrig = false;
+          });
       }
     }
   });
 
-  // Reactive automatic decryption for high-res photo in venue slideshow
+  // Reactive automatic decryption and pre-fetching for high-res photo in venue slideshow
   $effect(() => {
     if (
       isSlideshowRoute &&
@@ -434,19 +498,46 @@
       slideshowPhotos[currentSlideIndex]
     ) {
       const p = slideshowPhotos[currentSlideIndex];
-      if (isPhotoEncrypted(p) && !p.decrypted_orig_url && !p.original_blob && !p._isDecryptingOrig) {
-        p._isDecryptingOrig = true;
-        const key = resolveEventDecryptionKey(p);
-        if (key) {
+      const key = resolveEventDecryptionKey(p);
+      if (key && isPhotoEncrypted(p)) {
+        if (!p.decrypted_orig_url && !p.original_blob && !p._isDecryptingOrig) {
+          p._isDecryptingOrig = true;
           db.getDecryptedOriginalBlob(p, key)
             .then((blob) => {
               if (blob) {
-                const url = URL.createObjectURL(blob);
-                slideshowPhotos[currentSlideIndex] = { ...p, decrypted_orig_url: url };
+                const url = db.getCachedObjectURL(blob, `orig_${p.id || p.filename}`);
+                p.decrypted_orig_url = url;
+                p.original_blob = blob;
+                p._isDecryptingOrig = false;
+                slideshowPhotos[currentSlideIndex] = { ...p };
                 slideshowPhotos = [...slideshowPhotos];
               }
             })
-            .catch((e) => console.warn("Could not decrypt full original for slideshow slide:", e));
+            .catch((e) => {
+              console.warn("Could not decrypt full original for slideshow slide:", e);
+              p._isDecryptingOrig = false;
+            });
+        }
+
+        // Pre-fetch & decrypt next slide
+        const nextIdx = (currentSlideIndex + 1) % slideshowPhotos.length;
+        const nextP = slideshowPhotos[nextIdx];
+        if (nextP && isPhotoEncrypted(nextP) && !nextP.decrypted_orig_url && !nextP.original_blob && !nextP._isDecryptingOrig) {
+          nextP._isDecryptingOrig = true;
+          db.getDecryptedOriginalBlob(nextP, key)
+            .then((blob) => {
+              if (blob) {
+                const url = db.getCachedObjectURL(blob, `orig_${nextP.id || nextP.filename}`);
+                nextP.decrypted_orig_url = url;
+                nextP.original_blob = blob;
+                nextP._isDecryptingOrig = false;
+                slideshowPhotos[nextIdx] = { ...nextP };
+                slideshowPhotos = [...slideshowPhotos];
+              }
+            })
+            .catch(() => {
+              nextP._isDecryptingOrig = false;
+            });
         }
       }
     }
@@ -3449,9 +3540,17 @@
 
         // Reconcile:
         // A. Start with bucketPhotos (authoritative source of cloud files)
+        const currentSlideshowMap = new Map();
+        for (const p of slideshowPhotos) {
+          if (p.storage_orig_path) currentSlideshowMap.set(p.storage_orig_path, p);
+          if (p.filename) currentSlideshowMap.set(p.filename, p);
+          if (p.id) currentSlideshowMap.set(p.id, p);
+        }
+
         const updatedList = bucketPhotos.map((bp) => {
           const matched = localMap.get(bp.filename) || localMap.get(bp.storage_orig_path);
           const metadata = cloudMetadataMap.get(bp.storage_orig_path) || cloudMetadataMap.get(bp.filename);
+          const existingSlide = currentSlideshowMap.get(bp.storage_orig_path) || currentSlideshowMap.get(bp.filename) || (bp.id ? currentSlideshowMap.get(bp.id) : null);
           const localName = matched?.guest_name;
           return {
             ...bp,
@@ -3459,6 +3558,10 @@
             guest_id: matched?.guest_id || bp.guest_id || null,
             guest_token: matched?.guest_token || metadata?.guest_token || null,
             hash: matched?.hash || metadata?.hash || bp.hash || "",
+            decrypted_thumb_url: existingSlide?.decrypted_thumb_url || bp.decrypted_thumb_url,
+            decrypted_orig_url: existingSlide?.decrypted_orig_url || bp.decrypted_orig_url,
+            thumb_blob: existingSlide?.thumb_blob || bp.thumb_blob,
+            original_blob: existingSlide?.original_blob || bp.original_blob,
           };
         });
 
@@ -3537,6 +3640,9 @@
         api.getSlideshowConfig(slug),
       ]);
       guestEventData = eventRes.event;
+      if (guestEventData?.encryption_key && !crypto.getStoredEventKey(slug)) {
+        crypto.setStoredEventKey(slug, guestEventData.encryption_key);
+      }
       slideshowPhotos = photosRes.photos || [];
       decryptPhotosList(slideshowPhotos).then((p) => {
         slideshowPhotos = p;
@@ -4385,7 +4491,7 @@
                   <div class="upload-item-card">
                     <button
                       class="upload-thumb-click"
-                      onclick={() => (selectedPreviewPhoto = photo)}
+                      onclick={() => openPhotoPreview(photo)}
                     >
                       <img
                         src={getPhotoSrc(photo, true)}
@@ -4527,7 +4633,7 @@
                     onclick={() =>
                       isSelectionMode
                         ? togglePhotoSelection(photo.id)
-                        : (selectedPreviewPhoto = photo)}
+                        : openPhotoPreview(photo)}
                   >
                     <img
                       src={getPhotoSrc(photo, true)}
@@ -5694,7 +5800,7 @@
                   <div class="mod-card">
                     <button
                       class="mod-thumb-btn"
-                      onclick={() => (selectedPreviewPhoto = photo)}
+                      onclick={() => openPhotoPreview(photo)}
                     >
                       <img
                         src={getPhotoSrc(photo, true)}
@@ -5776,7 +5882,7 @@
                   <div class="mod-card">
                     <button
                       class="mod-thumb-btn"
-                      onclick={() => (selectedPreviewPhoto = photo)}
+                      onclick={() => openPhotoPreview(photo)}
                     >
                       <img
                         src={getPhotoSrc(photo, true)}
