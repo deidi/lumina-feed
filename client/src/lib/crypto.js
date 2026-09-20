@@ -303,3 +303,26 @@ export async function unwrapEventKeyForAdmin(wrappedKeyBase64, customPrivateKey 
     return '';
   }
 }
+
+/**
+ * 7. Parse event encryption key from URL hash fragment (#key=...) or query param (?k=...)
+ */
+export function parseEventKeyFromUrl(urlOrHash = '') {
+  const target = urlOrHash || (typeof window !== 'undefined' ? (window.location.hash || window.location.search || '') : '');
+  if (!target) return '';
+
+  // 1. Match #key= or &key= in hash fragment
+  const keyHashMatch = target.match(/(?:#|&)key=([a-zA-Z0-9_-]+)/);
+  if (keyHashMatch && keyHashMatch[1]) {
+    return keyHashMatch[1];
+  }
+
+  // 2. Match ?k= or &k= query parameter
+  const kQueryMatch = target.match(/[?&]k=([a-zA-Z0-9_-]+)/);
+  if (kQueryMatch && kQueryMatch[1]) {
+    return kQueryMatch[1];
+  }
+
+  return '';
+}
+

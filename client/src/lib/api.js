@@ -51,7 +51,7 @@ export const api = {
   getGuests: (slug) => dbMethods.getGuests(slug),
 
   // Photos (In-Browser Processing + IndexedDB Storage)
-  uploadPhoto: (slug, file, guestToken) => dbMethods.uploadPhoto(slug, file, guestToken),
+  uploadPhoto: (slug, file, guestToken, options = {}) => dbMethods.uploadPhoto(slug, file, guestToken, options),
   getPhotos: (slug, options = {}) => dbMethods.getPhotos(slug, options),
   syncPhotosFromCloud: (slug, options = {}) => dbMethods.syncPhotosFromCloud(slug, options),
   getMyQuota: async (slug, guestToken) => {

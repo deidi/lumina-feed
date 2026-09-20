@@ -1,9 +1,9 @@
 -- ==============================================================================
--- LuminaFeed Supabase Database Schema
+-- LuminaFeed Supabase Database Schema (v0.0.1 - Rebuild)
 -- 
 -- Run this script in your Supabase Project SQL Editor (https://supabase.com/dashboard)
--- This creates the tables for Host Details, Event Folder Ownership, 24-Hour TTL,
--- and Cross-Device Guest Directory.
+-- This creates the tables for Host Accounts, Event Settings, Frame Overlays,
+-- Guest Sessions, Photos, RLS Security Policies, and Storage Bucket Config.
 -- ==============================================================================
 
 -- 1. Hosts Table (24-hour ephemeral host spaces)
@@ -15,7 +15,7 @@ create table if not exists public.hosts (
   expires_at timestamptz not null default (now() + interval '24 hours')
 );
 
--- 2. Events Table (Event ownership linked to hosts)
+-- 2. Events Table (Event ownership, frame configuration, and quota settings)
 create table if not exists public.events (
   id uuid primary key default gen_random_uuid(),
   slug text not null unique,
@@ -25,13 +25,17 @@ create table if not exists public.events (
   date date default current_date,
   moderation_enabled boolean default true,
   auto_approve boolean default false,
-  guest_upload_limit integer default 20,
+  e2ee_enabled boolean default false,
+  allow_guest_downloads boolean default true,
+  frame_url text,
+  frame_config jsonb default '{"enabled": false, "preset": "none", "text": ""}'::jsonb,
+  guest_upload_limit integer default 15,
   max_photos integer default 100,
   created_at timestamptz not null default now(),
   expires_at timestamptz not null default (now() + interval '24 hours')
 );
 
--- 3. Guests Table (Cross-device guest attendance and upload counts)
+-- 3. Guests Table (Cross-device guest attendance, session tokens, and upload counts)
 create table if not exists public.guests (
   id uuid primary key default gen_random_uuid(),
   event_slug text not null references public.events(slug) on delete cascade,
@@ -43,8 +47,7 @@ create table if not exists public.guests (
   constraint unique_event_guest_token unique(event_slug, token)
 );
 
--- 4. Photo metadata is stored separately from Storage so guest attribution
--- survives page reloads, different devices, and missed real-time messages.
+-- 4. Photos Table (Photo metadata, approval status, captions, and frame tags)
 create table if not exists public.photos (
   id uuid primary key default gen_random_uuid(),
   event_slug text not null references public.events(slug) on delete cascade,
@@ -54,6 +57,9 @@ create table if not exists public.photos (
   hash text,
   guest_token text,
   guest_name text not null default 'Guest',
+  caption text,
+  has_frame boolean default false,
+  likes_count integer default 0,
   status text not null default 'pending' check (status in ('pending', 'approved', 'rejected')),
   width integer,
   height integer,
@@ -73,6 +79,7 @@ create index if not exists idx_events_expires on public.events(expires_at);
 create index if not exists idx_guests_event on public.guests(event_slug);
 create index if not exists idx_guests_token on public.guests(token);
 create index if not exists idx_photos_event on public.photos(event_slug);
+create index if not exists idx_photos_event_status on public.photos(event_slug, status);
 create index if not exists idx_photos_guest_token on public.photos(event_slug, guest_token);
 create index if not exists idx_photos_path on public.photos(storage_orig_path);
 
@@ -82,8 +89,7 @@ alter table public.events enable row level security;
 alter table public.guests enable row level security;
 alter table public.photos enable row level security;
 
--- 6. Open Permissive Policies for Anon Key
--- (Security is enforced client-side via PIN verification and host scoping)
+-- Permissive Policies for Anon Key (Access control verified via PIN & Host scoping)
 drop policy if exists "Allow all actions for anon on hosts" on public.hosts;
 create policy "Allow all actions for anon on hosts" on public.hosts
   for all using (true) with check (true);
@@ -100,13 +106,22 @@ drop policy if exists "Allow all actions for anon on photos" on public.photos;
 create policy "Allow all actions for anon on photos" on public.photos
   for all using (true) with check (true);
 
--- 7. Optional: Automated Cleanup Function for Expired Records
+-- 7. Storage Bucket Setup (luminafeed-photos)
+insert into storage.buckets (id, name, public)
+values ('luminafeed-photos', 'luminafeed-photos', true)
+on conflict (id) do update set public = true;
+
+-- Storage RLS Policies for Anon Key
+drop policy if exists "Public Access for luminafeed-photos" on storage.objects;
+create policy "Public Access for luminafeed-photos" on storage.objects
+  for all using (bucket_id = 'luminafeed-photos') with check (bucket_id = 'luminafeed-photos');
+
+-- 8. Automated Cleanup Function for Expired 24-Hour Records
 create or replace function public.cleanup_expired_luminafeed_records()
 returns integer as $$
 declare
   deleted_count integer;
 begin
-  -- Deleting from hosts automatically cascades to events and guests
   with deleted as (
     delete from public.hosts
     where expires_at < now()
@@ -114,7 +129,6 @@ begin
   )
   select count(*) into deleted_count from deleted;
   
-  -- Also delete orphaned events if any exist past expires_at
   delete from public.events where expires_at < now();
 
   return deleted_count;

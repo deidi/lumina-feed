@@ -1,5 +1,6 @@
 import { createClient } from '@supabase/supabase-js';
 import { encryptBlob, decryptBlob, getStoredEventKey } from './crypto.js';
+import { preFlightUploadCheck, withUploadRetry } from './network.js';
 
 export const DEFAULT_SUPABASE_URL = (
   import.meta.env?.VITE_SUPABASE_URL ||
@@ -16,125 +17,490 @@ export const DEFAULT_BUCKET = (
   'luminafeed-photos'
 ).trim();
 
-let cachedClient = null;
+// Quota Limits (Free-Tier Guard)
+export const EVENT_MAX_PHOTOS_LIMIT = 100;
+export const HOST_MAX_EVENTS_LIMIT = 5;
+export const GUEST_MAX_PHOTOS_LIMIT = 15;
 
-export function getSupabaseConfig() {
+let cachedClient = null;
+let currentClientKey = '';
+
+/**
+ * Retrieve current BaaS configuration (detects custom BYOK vs default environment)
+ */
+export function getBaaSConfig() {
+  const customUrl = localStorage.getItem('luminafeed_custom_supabase_url');
+  const customAnonKey = localStorage.getItem('luminafeed_custom_supabase_anon_key');
+  const customBucket = localStorage.getItem('luminafeed_custom_supabase_bucket');
+
+  if (customUrl && customAnonKey) {
+    return {
+      url: customUrl.trim(),
+      anonKey: customAnonKey.trim(),
+      bucket: (customBucket || DEFAULT_BUCKET).trim(),
+      isCustom: true,
+    };
+  }
+
   const url = (import.meta.env?.VITE_SUPABASE_URL || DEFAULT_SUPABASE_URL).trim();
   const anonKey = (import.meta.env?.VITE_SUPABASE_ANON_KEY || DEFAULT_SUPABASE_ANON_KEY).trim();
   const bucket = (import.meta.env?.VITE_SUPABASE_BUCKET || DEFAULT_BUCKET).trim();
-  return { url, anonKey, bucket };
+  return { url, anonKey, bucket, isCustom: false };
 }
 
-export function setSupabaseConfig() {
-  // Config is managed exclusively via .env
+export const getSupabaseConfig = getBaaSConfig;
+
+/**
+ * Set custom Supabase / BaaS credentials (BYOK)
+ */
+export function setCustomBaaSConfig({ url, anonKey, bucket = 'luminafeed-photos' }) {
+  if (!url || !anonKey) {
+    throw new Error('Project URL and Public Anon Key are required.');
+  }
+  localStorage.setItem('luminafeed_custom_supabase_url', url.trim());
+  localStorage.setItem('luminafeed_custom_supabase_anon_key', anonKey.trim());
+  localStorage.setItem('luminafeed_custom_supabase_bucket', (bucket || DEFAULT_BUCKET).trim());
   cachedClient = null;
+  currentClientKey = '';
+  return getBaaSConfig();
 }
 
-export function resetSupabaseConfig() {
-  localStorage.removeItem('luminafeed_supabase_url');
-  localStorage.removeItem('caps_supabase_url');
-  localStorage.removeItem('luminafeed_supabase_anon_key');
-  localStorage.removeItem('caps_supabase_anon_key');
-  localStorage.removeItem('luminafeed_supabase_bucket');
-  localStorage.removeItem('caps_supabase_bucket');
+/**
+ * Reset to default pre-configured Supabase Cloud backend
+ */
+export function resetToDefaultBaaS() {
+  localStorage.removeItem('luminafeed_custom_supabase_url');
+  localStorage.removeItem('luminafeed_custom_supabase_anon_key');
+  localStorage.removeItem('luminafeed_custom_supabase_bucket');
   cachedClient = null;
-  return getSupabaseConfig();
+  currentClientKey = '';
+  return getBaaSConfig();
 }
+
+export const resetSupabaseConfig = resetToDefaultBaaS;
 
 export function isStorageConfigured() {
-  const { url, anonKey } = getSupabaseConfig();
+  const { url, anonKey } = getBaaSConfig();
   return Boolean(url && anonKey);
 }
 
+/**
+ * Get dynamic Supabase client instance
+ */
 export function getSupabaseClient() {
-  if (cachedClient) return cachedClient;
-  const { url, anonKey } = getSupabaseConfig();
-  if (!url || !anonKey) {
-    throw new Error('Supabase Storage is not configured. Please set your Project URL and Anon Key in Settings.');
+  const config = getBaaSConfig();
+  const configKey = `${config.url}_${config.anonKey}`;
+  if (cachedClient && currentClientKey === configKey) {
+    return cachedClient;
   }
-  cachedClient = createClient(url, anonKey, {
+
+  if (!config.url || !config.anonKey) {
+    throw new Error('Supabase BaaS is not configured. Please set Project URL and Anon Key.');
+  }
+
+  cachedClient = createClient(config.url, config.anonKey, {
     auth: {
       persistSession: false,
       autoRefreshToken: false,
     },
   });
+  currentClientKey = configKey;
   return cachedClient;
 }
 
 /**
- * Test connectivity to Supabase with fast, lightweight zero-write verification.
- * 1. Checks reachability of public CDN bucket endpoint (verifies host, TLS, and bucket existence).
- * 2. Queries list endpoint using anon API key (verifies permissions).
+ * 1-Click SQL Setup Script Generator for BYOK Hosts
  */
-export async function testStorageConnection(timeoutMs = 8000) {
-  const { url, anonKey, bucket } = getSupabaseConfig();
-  if (!url || !anonKey) {
-    throw new Error('Supabase Storage is not configured. Project URL or Anon Key is missing.');
+export function get1ClickSQLSetupScript() {
+  return `-- ==============================================================================
+-- LuminaFeed Supabase Setup Script (1-Click Initialization)
+-- Run this in your Supabase SQL Editor: https://supabase.com/dashboard/project/_/sql
+-- ==============================================================================
+
+-- 1. Hosts Table (24-Hour Ephemeral Lifecycle)
+create table if not exists public.hosts (
+  id uuid primary key default gen_random_uuid(),
+  host_name text not null unique,
+  pin_hash text not null,
+  created_at timestamptz not null default now(),
+  expires_at timestamptz not null default (now() + interval '24 hours')
+);
+
+-- 2. Events Table (Ownership, Custom Frames, Quotas & Settings)
+create table if not exists public.events (
+  id uuid primary key default gen_random_uuid(),
+  slug text not null unique,
+  name text not null,
+  host_name text not null references public.hosts(host_name) on delete cascade,
+  tagline text default 'Memories Shared in Real-Time',
+  date date default current_date,
+  moderation_enabled boolean default true,
+  auto_approve boolean default false,
+  e2ee_enabled boolean default false,
+  allow_guest_downloads boolean default true,
+  frame_url text,
+  frame_config jsonb default '{"enabled": false, "preset": "none", "text": ""}'::jsonb,
+  guest_upload_limit integer default 15,
+  max_photos integer default 100,
+  created_at timestamptz not null default now(),
+  expires_at timestamptz not null default (now() + interval '24 hours')
+);
+
+-- 3. Guests Table (Cross-Device Session Tokens & Attendance)
+create table if not exists public.guests (
+  id uuid primary key default gen_random_uuid(),
+  event_slug text not null references public.events(slug) on delete cascade,
+  name text not null,
+  token text not null,
+  upload_count integer default 0,
+  created_at timestamptz not null default now(),
+  last_seen timestamptz not null default now(),
+  constraint unique_event_guest_token unique(event_slug, token)
+);
+
+-- 4. Photos Table (Metadata, Moderation Status, Captions, Likes & Frames)
+create table if not exists public.photos (
+  id uuid primary key default gen_random_uuid(),
+  event_slug text not null references public.events(slug) on delete cascade,
+  storage_orig_path text not null,
+  storage_thumb_path text,
+  filename text not null,
+  hash text,
+  guest_token text,
+  guest_name text not null default 'Guest',
+  caption text,
+  has_frame boolean default false,
+  likes_count integer default 0,
+  status text not null default 'pending' check (status in ('pending', 'approved', 'rejected')),
+  width integer,
+  height integer,
+  size bigint,
+  mime_type text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  constraint unique_event_photo_path unique(event_slug, storage_orig_path)
+);
+
+-- 5. Fast Retrieval Indexes
+create index if not exists idx_hosts_name on public.hosts(host_name);
+create index if not exists idx_hosts_expires on public.hosts(expires_at);
+create index if not exists idx_events_host on public.events(host_name);
+create index if not exists idx_events_slug on public.events(slug);
+create index if not exists idx_events_expires on public.events(expires_at);
+create index if not exists idx_guests_event on public.guests(event_slug);
+create index if not exists idx_guests_token on public.guests(token);
+create index if not exists idx_photos_event on public.photos(event_slug);
+create index if not exists idx_photos_event_status on public.photos(event_slug, status);
+create index if not exists idx_photos_guest_token on public.photos(event_slug, guest_token);
+create index if not exists idx_photos_path on public.photos(storage_orig_path);
+
+-- 6. Row Level Security Policies (Anon Permissive)
+alter table public.hosts enable row level security;
+alter table public.events enable row level security;
+alter table public.guests enable row level security;
+alter table public.photos enable row level security;
+
+drop policy if exists "Allow all actions for anon on hosts" on public.hosts;
+create policy "Allow all actions for anon on hosts" on public.hosts for all using (true) with check (true);
+
+drop policy if exists "Allow all actions for anon on events" on public.events;
+create policy "Allow all actions for anon on events" on public.events for all using (true) with check (true);
+
+drop policy if exists "Allow all actions for anon on guests" on public.guests;
+create policy "Allow all actions for anon on guests" on public.guests for all using (true) with check (true);
+
+drop policy if exists "Allow all actions for anon on photos" on public.photos;
+create policy "Allow all actions for anon on photos" on public.photos for all using (true) with check (true);
+
+-- 7. Storage Bucket Setup & Policies
+insert into storage.buckets (id, name, public)
+values ('luminafeed-photos', 'luminafeed-photos', true)
+on conflict (id) do update set public = true;
+
+drop policy if exists "Public Access for luminafeed-photos" on storage.objects;
+create policy "Public Access for luminafeed-photos" on storage.objects
+  for all using (bucket_id = 'luminafeed-photos') with check (bucket_id = 'luminafeed-photos');
+
+-- 8. Cleanup Function for Expired Records
+create or replace function public.cleanup_expired_luminafeed_records()
+returns integer as $$
+declare
+  deleted_count integer;
+begin
+  with deleted as (
+    delete from public.hosts where expires_at < now() returning id
+  )
+  select count(*) into deleted_count from deleted;
+  delete from public.events where expires_at < now();
+  return deleted_count;
+end;
+$$ language plpgsql security definer;
+`;
+}
+
+/**
+ * Comprehensive Non-Destructive Schema & Storage Health Probe
+ */
+export async function testBaaSConnection(customConfig = null, timeoutMs = 8000) {
+  const config = customConfig || getBaaSConfig();
+  if (!config.url || !config.anonKey) {
+    return {
+      ok: false,
+      apiOk: false,
+      bucketOk: false,
+      tables: { hosts: false, events: false, guests: false, photos: false },
+      missingTables: ['hosts', 'events', 'guests', 'photos'],
+      message: 'Supabase URL or Public Anon Key is missing.',
+    };
   }
 
-  const cleanUrl = url.replace(/\/+$/, '');
+  const cleanUrl = config.url.replace(/\/+$/, '');
+  const bucket = config.bucket || 'luminafeed-photos';
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
+  let apiOk = false;
+  let bucketOk = false;
+  const tables = { hosts: false, events: false, guests: false, photos: false };
+
   try {
-    // 1. Fast zero-write verification via public CDN endpoint to check bucket existence
-    const probePath = `.probe_${Date.now()}`;
-    const publicUrl = `${cleanUrl}/storage/v1/object/public/${encodeURIComponent(bucket)}/${probePath}`;
-
-    try {
-      const pubRes = await fetch(publicUrl, {
-        method: 'GET',
-        signal: controller.signal,
-      });
-
-      if (pubRes.ok || pubRes.status === 404) {
-        const text = await pubRes.text().catch(() => '');
-        if (text.includes('NoSuchBucket') || text.includes('Bucket not found')) {
-          throw new Error(`Storage bucket '${bucket}' does not exist or is not public in your Supabase project.`);
-        }
-      } else if (pubRes.status === 400) {
-        const text = await pubRes.text().catch(() => '');
-        if (text.includes('NoSuchBucket') || text.includes('Bucket not found')) {
-          throw new Error(`Storage bucket '${bucket}' was not found in project ${cleanUrl}.`);
-        }
-      }
-    } catch (fetchErr) {
-      if (fetchErr.name === 'AbortError') {
-        throw fetchErr;
-      }
-      if (fetchErr.message && fetchErr.message.includes('bucket')) {
-        throw fetchErr;
-      }
-      // If public endpoint failed due to network/DNS/offline
-      if (fetchErr instanceof TypeError || (fetchErr.message && fetchErr.message.includes('Failed to fetch'))) {
-        throw new Error(`Unable to reach Supabase project at ${cleanUrl}. Check your internet connection or project URL.`);
-      }
-    }
-
-    // 2. Verify Anon Key & bucket read permissions via Supabase Client
-    const client = getSupabaseClient();
-    const { error: listError } = await client.storage.from(bucket).list('', {
-      limit: 1,
-      offset: 0,
+    const probeClient = createClient(cleanUrl, config.anonKey, {
+      auth: { persistSession: false, autoRefreshToken: false },
     });
 
-    if (listError) {
-      throw new Error(`Supabase Storage Error: ${listError.message || 'Access denied'}. Check your Anon Key.`);
+    // 1. Test Storage Bucket Accessibility
+    try {
+      const { data: listData, error: listErr } = await probeClient.storage.from(bucket).list('', {
+        limit: 1,
+      });
+      if (!listErr) {
+        bucketOk = true;
+        apiOk = true;
+      }
+    } catch (_) {}
+
+    // 2. Test PostgreSQL Tables
+    const tableKeys = ['hosts', 'events', 'guests', 'photos'];
+    await Promise.all(
+      tableKeys.map(async tbl => {
+        try {
+          const { error } = await probeClient.from(tbl).select('id').limit(1);
+          if (!error) {
+            tables[tbl] = true;
+            apiOk = true;
+          }
+        } catch (_) {}
+      })
+    );
+
+    const missingTables = tableKeys.filter(t => !tables[t]);
+    const allTablesOk = missingTables.length === 0;
+    const isFullyReady = apiOk && bucketOk && allTablesOk;
+
+    let message = '🟢 Supabase Backend is ready and all tables are configured!';
+    if (!apiOk) {
+      message = '❌ Unable to connect to Supabase. Check your Project URL and Anon Key.';
+    } else if (!bucketOk && !allTablesOk) {
+      message = '⚠️ Connected, but Storage Bucket and SQL tables are missing. Please run the 1-Click SQL Script.';
+    } else if (!allTablesOk) {
+      message = `⚠️ Missing database tables (${missingTables.join(', ')}). Please run the 1-Click SQL Script.`;
+    } else if (!bucketOk) {
+      message = `⚠️ Storage bucket "${bucket}" not found or not public.`;
     }
 
     return {
-      success: true,
-      bucket,
-      message: `Connected to Supabase Cloud Storage (Bucket: "${bucket}")`
+      ok: isFullyReady,
+      apiOk,
+      bucketOk,
+      tables,
+      missingTables,
+      message,
     };
   } catch (err) {
-    if (err.name === 'AbortError') {
-      throw new Error(`Connection timed out (${timeoutMs}ms). Supabase project is unreachable or offline.`);
-    }
-    throw err;
+    return {
+      ok: false,
+      apiOk: false,
+      bucketOk: false,
+      tables,
+      missingTables: ['hosts', 'events', 'guests', 'photos'],
+      message: err.message || 'Connection failed.',
+    };
   } finally {
     clearTimeout(timeoutId);
   }
+}
+
+export const testStorageConnection = testBaaSConnection;
+
+/**
+ * Check if the event has reached its maximum photo quota (100 photos limit)
+ */
+export async function checkEventPhotoQuota(eventSlug, maxAllowed = EVENT_MAX_PHOTOS_LIMIT) {
+  if (!eventSlug || !isStorageConfigured()) return { allowed: true, count: 0, limit: maxAllowed };
+  try {
+    const client = getSupabaseClient();
+    const { count, error } = await client
+      .from('photos')
+      .select('*', { count: 'exact', head: true })
+      .eq('event_slug', eventSlug);
+
+    if (!error && count !== null) {
+      return {
+        allowed: count < maxAllowed,
+        count,
+        limit: maxAllowed,
+        remaining: Math.max(0, maxAllowed - count),
+      };
+    }
+
+    // Fallback to storage file listing if DB table is unpopulated
+    const files = await listEventPhotosFromStorage(eventSlug);
+    const photoCount = files.length;
+    return {
+      allowed: photoCount < maxAllowed,
+      count: photoCount,
+      limit: maxAllowed,
+      remaining: Math.max(0, maxAllowed - photoCount),
+    };
+  } catch (_) {
+    return { allowed: true, count: 0, limit: maxAllowed };
+  }
+}
+
+/**
+ * Check if the host has reached the 5 concurrent active events quota
+ */
+export async function checkHostEventQuota(hostName, maxAllowed = HOST_MAX_EVENTS_LIMIT) {
+  if (!hostName || !isStorageConfigured()) return { allowed: true, count: 0, limit: maxAllowed };
+  try {
+    const client = getSupabaseClient();
+    const nowIso = new Date().toISOString();
+    const { count, error } = await client
+      .from('events')
+      .select('*', { count: 'exact', head: true })
+      .ilike('host_name', hostName.trim())
+      .gt('expires_at', nowIso);
+
+    if (!error && count !== null) {
+      return {
+        allowed: count < maxAllowed,
+        count,
+        limit: maxAllowed,
+        remaining: Math.max(0, maxAllowed - count),
+      };
+    }
+    return { allowed: true, count: 0, limit: maxAllowed };
+  } catch (_) {
+    return { allowed: true, count: 0, limit: maxAllowed };
+  }
+}
+
+/**
+ * Check if a guest has reached their personal upload quota (15 photos limit)
+ */
+export async function checkGuestUploadQuota(eventSlug, guestToken, maxAllowed = GUEST_MAX_PHOTOS_LIMIT) {
+  if (!eventSlug || !guestToken || !isStorageConfigured()) {
+    return { allowed: true, count: 0, limit: maxAllowed };
+  }
+  try {
+    const client = getSupabaseClient();
+    const { data: guestData, error } = await client
+      .from('guests')
+      .select('upload_count')
+      .eq('event_slug', eventSlug)
+      .eq('token', guestToken)
+      .maybeSingle();
+
+    if (!error && guestData) {
+      const count = Number(guestData.upload_count) || 0;
+      return {
+        allowed: count < maxAllowed,
+        count,
+        limit: maxAllowed,
+        remaining: Math.max(0, maxAllowed - count),
+      };
+    }
+    return { allowed: true, count: 0, limit: maxAllowed };
+  } catch (_) {
+    return { allowed: true, count: 0, limit: maxAllowed };
+  }
+}
+
+/**
+ * Custom Host Frame Management (Upload frame PNG overlay)
+ */
+export async function uploadEventFrame(eventSlug, frameFileOrBlob) {
+  if (!eventSlug || !frameFileOrBlob || !isStorageConfigured()) {
+    throw new Error('Event slug and frame file are required.');
+  }
+  const client = getSupabaseClient();
+  const { bucket } = getBaaSConfig();
+  const safeSlug = eventSlug.replace(/[^a-zA-Z0-9-_]/g, '_');
+  const path = `_frames/${safeSlug}/frame.png`;
+
+  const { error } = await client.storage.from(bucket).upload(path, frameFileOrBlob, {
+    contentType: 'image/png',
+    upsert: true,
+  });
+
+  if (error) {
+    throw new Error(`Failed to upload custom frame: ${error.message}`);
+  }
+
+  const { data: urlData } = client.storage.from(bucket).getPublicUrl(path);
+  const frameUrl = `${urlData.publicUrl}?t=${Date.now()}`;
+
+  // Update event record in DB if available
+  try {
+    await client
+      .from('events')
+      .update({
+        frame_url: frameUrl,
+        frame_config: { enabled: true, preset: 'custom' },
+      })
+      .eq('slug', eventSlug);
+  } catch (_) {}
+
+  return { path, frameUrl };
+}
+
+/**
+ * Delete custom event frame
+ */
+export async function deleteEventFrame(eventSlug) {
+  if (!eventSlug || !isStorageConfigured()) return;
+  try {
+    const client = getSupabaseClient();
+    const { bucket } = getBaaSConfig();
+    const safeSlug = eventSlug.replace(/[^a-zA-Z0-9-_]/g, '_');
+    const path = `_frames/${safeSlug}/frame.png`;
+    await client.storage.from(bucket).remove([path]);
+
+    try {
+      await client
+        .from('events')
+        .update({
+          frame_url: null,
+          frame_config: { enabled: false, preset: 'none' },
+        })
+        .eq('slug', eventSlug);
+    } catch (_) {}
+  } catch (err) {
+    console.warn('deleteEventFrame warning:', err);
+  }
+}
+
+/**
+ * Extract storage path from a public CDN URL
+ */
+function extractStoragePath(urlOrPath, bucket) {
+  if (!urlOrPath) return '';
+  const bucketPrefix = `/storage/v1/object/public/${bucket}/`;
+  const idx = urlOrPath.indexOf(bucketPrefix);
+  if (idx !== -1) {
+    return decodeURIComponent(urlOrPath.substring(idx + bucketPrefix.length).split('?')[0]);
+  }
+  return urlOrPath.replace(/^\/+/, '').split('?')[0];
 }
 
 /**
@@ -147,9 +513,30 @@ export async function uploadPhotoToStorage({
   thumbBlob,
   mimeType = 'image/jpeg',
   encryptionKey = '',
+  caption = '',
+  hasFrame = false,
+  guestName = 'Guest',
+  guestToken = '',
 }) {
+  // Pre-Flight Connectivity Check
+  await preFlightUploadCheck(3500);
+
+  // Check Event Quota
+  const quotaCheck = await checkEventPhotoQuota(eventSlug);
+  if (!quotaCheck.allowed) {
+    throw new Error(`Event photo quota reached (maximum ${EVENT_MAX_PHOTOS_LIMIT} photos).`);
+  }
+
+  // Check Guest Quota
+  if (guestToken) {
+    const guestQuota = await checkGuestUploadQuota(eventSlug, guestToken);
+    if (!guestQuota.allowed) {
+      throw new Error(`Guest upload quota reached (maximum ${GUEST_MAX_PHOTOS_LIMIT} photos per guest).`);
+    }
+  }
+
   const client = getSupabaseClient();
-  const { bucket } = getSupabaseConfig();
+  const { bucket } = getBaaSConfig();
 
   const safeSlug = (eventSlug || 'default').replace(/[^a-zA-Z0-9-_]/g, '_');
   const safeName = (fileName || `photo_${Date.now()}.jpg`).replace(/[^a-zA-Z0-9-_\.]/g, '_');
@@ -173,47 +560,55 @@ export async function uploadPhotoToStorage({
     }
   }
 
-  const extSuffix = isEncrypted ? '.enc' : '';
+  const extSuffix = isEncrypted ? '.lenc' : '';
   const origPath = `${safeSlug}/orig_${timestamp}_${rand}_${safeName}${extSuffix}`;
   const thumbPath = `${safeSlug}/thumb_${timestamp}_${rand}_${safeName}${extSuffix}`;
   const uploadContentType = isEncrypted ? 'application/octet-stream' : mimeType;
 
-  // 1. Upload original photo
-  const { error: origError } = await client.storage.from(bucket).upload(origPath, finalOrigBlob, {
-    contentType: uploadContentType,
-    upsert: true,
-  });
+  // Execute upload with strict 15s timeout and automatic retry
+  return await withUploadRetry(async () => {
+    // 1. Upload original photo
+    const { error: origError } = await client.storage.from(bucket).upload(origPath, finalOrigBlob, {
+      contentType: uploadContentType,
+      upsert: true,
+    });
 
-  if (origError) {
-    throw new Error(`Original photo upload failed: ${origError.message}`);
-  }
+    if (origError) {
+      throw new Error(`Original photo upload failed: ${origError.message}`);
+    }
 
-  // 2. Upload micro-thumbnail
-  const { error: thumbError } = await client.storage.from(bucket).upload(thumbPath, finalThumbBlob, {
-    contentType: uploadContentType,
-    upsert: true,
-  });
+    // 2. Upload micro-thumbnail
+    const { error: thumbError } = await client.storage.from(bucket).upload(thumbPath, finalThumbBlob, {
+      contentType: uploadContentType,
+      upsert: true,
+    });
 
-  if (thumbError) {
-    console.warn(`Thumbnail upload warning: ${thumbError.message}`);
-  }
+    if (thumbError) {
+      console.warn(`Thumbnail upload warning: ${thumbError.message}`);
+    }
 
-  // 3. Get Public CDN URLs
-  const { data: origUrlData } = client.storage.from(bucket).getPublicUrl(origPath);
-  const { data: thumbUrlData } = client.storage.from(bucket).getPublicUrl(thumbPath);
+    // 3. Get Public CDN URLs
+    const { data: origUrlData } = client.storage.from(bucket).getPublicUrl(origPath);
+    const { data: thumbUrlData } = client.storage.from(bucket).getPublicUrl(thumbPath);
 
-  const origUrl = origUrlData?.publicUrl || '';
-  const thumbUrl = thumbUrlData?.publicUrl || origUrl;
+    const origUrl = origUrlData?.publicUrl || '';
+    const thumbUrl = thumbUrlData?.publicUrl || origUrl;
 
-  return {
-    origPath,
-    thumbPath,
-    origUrl,
-    thumbUrl,
-    bucket,
-    isEncrypted,
-  };
+    return {
+      origPath,
+      thumbPath,
+      origUrl,
+      thumbUrl,
+      bucket,
+      isEncrypted,
+      caption,
+      hasFrame,
+      guestName,
+      guestToken,
+    };
+  }, 2, 15000);
 }
+
 
 /**
  * Fetch and optionally decrypt a photo from Supabase Storage
@@ -221,7 +616,7 @@ export async function uploadPhotoToStorage({
 export async function fetchAndDecryptPhoto(urlOrPath, encryptionKey = '') {
   if (!urlOrPath) return null;
   const client = getSupabaseClient();
-  const { bucket } = getSupabaseConfig();
+  const { bucket } = getBaaSConfig();
   let blob = null;
 
   try {
@@ -252,221 +647,76 @@ export async function fetchAndDecryptPhoto(urlOrPath, encryptionKey = '') {
       return blob;
     }
   }
+
   return blob;
 }
 
 /**
- * Helper to extract Supabase storage object path from a URL or raw path string
+ * Delete a single photo from Supabase Storage and database
  */
-export function extractStoragePath(pathOrUrl, bucketName = null) {
-  if (!pathOrUrl || typeof pathOrUrl !== 'string') return '';
-  const trimmed = pathOrUrl.trim();
-  if (!trimmed || trimmed.startsWith('data:') || trimmed.startsWith('blob:')) return '';
-
-  const bucket = bucketName || getSupabaseConfig().bucket;
-
-  if (!trimmed.startsWith('http://') && !trimmed.startsWith('https://')) {
-    let p = trimmed.replace(/^\/+/, '');
-    if (p.startsWith(bucket + '/')) {
-      p = p.substring(bucket.length + 1);
-    }
-    return p;
-  }
-
-  try {
-    const urlObj = new URL(trimmed);
-    const pathname = urlObj.pathname;
-
-    const marker = `/object/public/${bucket}/`;
-    const markerIdx = pathname.indexOf(marker);
-    if (markerIdx !== -1) {
-      return decodeURIComponent(pathname.substring(markerIdx + marker.length));
-    }
-
-    const signMarker = `/object/sign/${bucket}/`;
-    const signIdx = pathname.indexOf(signMarker);
-    if (signIdx !== -1) {
-      return decodeURIComponent(pathname.substring(signIdx + signMarker.length));
-    }
-
-    const genericMarker = `/${bucket}/`;
-    const genericIdx = pathname.indexOf(genericMarker);
-    if (genericIdx !== -1) {
-      return decodeURIComponent(pathname.substring(genericIdx + genericMarker.length));
-    }
-  } catch (e) {
-    // Ignore URL parse error and return trimmed string
-  }
-
-  return trimmed;
-}
-
-/**
- * Delete a photo from Supabase Storage by raw paths or URLs
- */
-export async function deletePhotoFromStorage(paths = []) {
-  if (!paths || !paths.length) return { success: true, deletedCount: 0 };
-  if (!isStorageConfigured()) return { success: true, deletedCount: 0 };
-
+export async function deleteIndividualPhotoFromStorage(origPathOrUrl, thumbPathOrUrl) {
+  if (!isStorageConfigured()) return { success: false, error: 'Storage not configured' };
   try {
     const client = getSupabaseClient();
-    const { bucket } = getSupabaseConfig();
-    const validPaths = paths
-      .map(p => extractStoragePath(p, bucket))
-      .filter(p => Boolean(p && !p.startsWith('data:') && !p.startsWith('blob:')));
+    const { bucket } = getBaaSConfig();
+    const paths = [];
 
-    if (validPaths.length > 0) {
-      const { data, error } = await client.storage.from(bucket).remove(validPaths);
-      if (error) {
-        console.warn('Failed to delete photo from Supabase:', error.message);
-        return { success: false, error: error.message };
-      }
-      return { success: true, deletedCount: validPaths.length, data };
+    if (origPathOrUrl) {
+      const p = extractStoragePath(origPathOrUrl, bucket);
+      if (p) paths.push(p);
     }
-    return { success: true, deletedCount: 0 };
+    if (thumbPathOrUrl) {
+      const p = extractStoragePath(thumbPathOrUrl, bucket);
+      if (p) paths.push(p);
+    }
+
+    if (paths.length > 0) {
+      await client.storage.from(bucket).remove(paths);
+      try {
+        await client.from('photos').delete().in('storage_orig_path', paths);
+      } catch (_) {}
+    }
+
+    return { success: true };
   } catch (err) {
-    console.warn('Failed to delete photo from Supabase:', err);
     return { success: false, error: err.message };
   }
 }
 
 /**
- * Delete an individual photo's assets (both full-resolution and micro-thumbnail) from Supabase Storage
+ * Permanently purge all photos, thumbnails, frames and manifests for an event
  */
-export async function deleteIndividualPhotoFromStorage(photoOrPaths, eventSlug = '') {
-  if (!photoOrPaths) return { success: false, deletedCount: 0, paths: [] };
-  if (!isStorageConfigured()) return { success: true, deletedCount: 0, paths: [] };
-
+export async function deleteEventFilesFromStorage(eventSlug) {
+  if (!eventSlug || !isStorageConfigured()) return { success: false };
   try {
     const client = getSupabaseClient();
-    const { bucket } = getSupabaseConfig();
-    const pathsToPurge = new Set();
-
-    if (Array.isArray(photoOrPaths)) {
-      for (const item of photoOrPaths) {
-        const extracted = extractStoragePath(item, bucket);
-        if (extracted) pathsToPurge.add(extracted);
-      }
-    } else if (typeof photoOrPaths === 'string') {
-      const extracted = extractStoragePath(photoOrPaths, bucket);
-      if (extracted) pathsToPurge.add(extracted);
-    } else if (typeof photoOrPaths === 'object') {
-      const p = photoOrPaths;
-      // 1. Direct path fields
-      if (p.storage_orig_path) pathsToPurge.add(extractStoragePath(p.storage_orig_path, bucket));
-      if (p.storage_thumb_path) pathsToPurge.add(extractStoragePath(p.storage_thumb_path, bucket));
-      if (p.origPath) pathsToPurge.add(extractStoragePath(p.origPath, bucket));
-      if (p.thumbPath) pathsToPurge.add(extractStoragePath(p.thumbPath, bucket));
-
-      // 2. URL fields
-      if (p.original_url) pathsToPurge.add(extractStoragePath(p.original_url, bucket));
-      if (p.thumb_url) pathsToPurge.add(extractStoragePath(p.thumb_url, bucket));
-      if (p.origUrl) pathsToPurge.add(extractStoragePath(p.origUrl, bucket));
-      if (p.thumbUrl) pathsToPurge.add(extractStoragePath(p.thumbUrl, bucket));
-      if (p.original_path) pathsToPurge.add(extractStoragePath(p.original_path, bucket));
-      if (p.thumbnail_path) pathsToPurge.add(extractStoragePath(p.thumbnail_path, bucket));
-
-      // 3. File name / paired thumbnail derivation
-      const slug = eventSlug || p.event_slug || '';
-      if (slug && p.filename) {
-        if (p.filename.startsWith(`${slug}/`)) {
-          pathsToPurge.add(p.filename);
-        }
-      }
-
-      // Automatically pair original and thumb if only one was present
-      for (const path of Array.from(pathsToPurge)) {
-        if (path.includes('/orig_')) {
-          pathsToPurge.add(path.replace('/orig_', '/thumb_'));
-        } else if (path.includes('/thumb_')) {
-          pathsToPurge.add(path.replace('/thumb_', '/orig_'));
-        }
-      }
-    }
-
-    const validPaths = Array.from(pathsToPurge).filter(
-      p => Boolean(p && typeof p === 'string' && !p.startsWith('data:') && !p.startsWith('blob:'))
-    );
-
-    if (validPaths.length === 0) {
-      return { success: true, deletedCount: 0, paths: [] };
-    }
-
-    const { data, error } = await client.storage.from(bucket).remove(validPaths);
-    if (error) {
-      console.warn('Failed to delete individual photo from Supabase:', error.message);
-      return { success: false, error: error.message, paths: validPaths };
-    }
-
-    // Keep the metadata directory in step with Storage. A failed metadata cleanup
-    // is harmless: cloud sync only renders records that still have a Storage file.
-    const origPath = validPaths.find(path => !path.includes('/thumb_'));
-    const metadataEventSlug = eventSlug || (typeof photoOrPaths === 'object' ? photoOrPaths.event_slug : '');
-    if (origPath && metadataEventSlug) {
-      await client.from('photos').delete().eq('event_slug', metadataEventSlug).eq('storage_orig_path', origPath);
-    }
-
-    return { success: true, deletedCount: validPaths.length, paths: validPaths, data };
-  } catch (err) {
-    console.warn('Error deleting individual photo from Supabase:', err);
-    return { success: false, error: err.message, paths: [] };
-  }
-}
-
-/**
- * Delete all files belonging to an event from Supabase Storage
- */
-export async function deleteEventFilesFromStorage(eventSlug, specificPaths = []) {
-  if (!eventSlug) return { success: false, deletedCount: 0 };
-  if (!isStorageConfigured()) return { success: true, deletedCount: 0 };
-
-  try {
-    const client = getSupabaseClient();
-    const { bucket } = getSupabaseConfig();
+    const { bucket } = getBaaSConfig();
     const safeSlug = eventSlug.replace(/[^a-zA-Z0-9-_]/g, '_');
-    const allPaths = new Set(specificPaths.filter(Boolean));
+    const allPaths = new Set();
 
-    // Query the event's folder in Supabase bucket to include all files
+    // 1. Collect all photo assets
     try {
-      const { data: files, error: listError } = await client.storage.from(bucket).list(safeSlug, {
-        limit: 1000,
-        offset: 0,
-      });
-
-      if (!listError && files && files.length > 0) {
-        for (const file of files) {
-          if (file.name) {
-            allPaths.add(`${safeSlug}/${file.name}`);
-          }
-        }
-      }
-    } catch (listErr) {
-      console.warn('Could not list folder in Supabase:', listErr);
-    }
-
-    // Also scan and include event manifests and approved photo registry in _events/
-    try {
-      const { data: manifestFiles } = await client.storage.from(bucket).list('_events', {
-        limit: 200,
-      });
-      if (manifestFiles && manifestFiles.length > 0) {
-        manifestFiles.forEach(f => {
-          if (
-            f.name &&
-            (f.name === `${safeSlug}.json` ||
-              f.name === `${safeSlug}_approved.json` ||
-              f.name === `${eventSlug}.json` ||
-              f.name === `${eventSlug}_approved.json` ||
-              f.name.startsWith(`${safeSlug}_`) ||
-              f.name.startsWith(`${eventSlug}_`))
-          ) {
-            allPaths.add(`_events/${f.name}`);
+      const { data: files } = await client.storage.from(bucket).list(safeSlug, { limit: 500 });
+      if (files && files.length > 0) {
+        files.forEach(f => {
+          if (f && f.name && !f.name.startsWith('.')) {
+            allPaths.add(`${safeSlug}/${f.name}`);
           }
         });
       }
     } catch (_) {}
 
-    // Explicitly add candidate manifest file paths
+    // 2. Collect frame assets
+    try {
+      const { data: frameFiles } = await client.storage.from(bucket).list(`_frames/${safeSlug}`, { limit: 10 });
+      if (frameFiles && frameFiles.length > 0) {
+        frameFiles.forEach(f => {
+          if (f && f.name) allPaths.add(`_frames/${safeSlug}/${f.name}`);
+        });
+      }
+    } catch (_) {}
+
+    // 3. Manifests
     allPaths.add(`_events/${safeSlug}.json`);
     allPaths.add(`_events/${safeSlug}_approved.json`);
     allPaths.add(`_events/${eventSlug}.json`);
@@ -474,18 +724,10 @@ export async function deleteEventFilesFromStorage(eventSlug, specificPaths = [])
 
     const pathsToDelete = Array.from(allPaths);
     if (pathsToDelete.length > 0) {
-      try {
-        const { error: removeError } = await client.storage.from(bucket).remove(pathsToDelete);
-        if (removeError) {
-          console.warn('Notice while removing event files from Supabase Storage:', removeError.message);
-        }
-      } catch (remErr) {
-        console.warn('client.storage.remove notice:', remErr);
-      }
-      return { success: true, deletedCount: pathsToDelete.length };
+      await client.storage.from(bucket).remove(pathsToDelete);
     }
 
-    return { success: true, deletedCount: 0 };
+    return { success: true, deletedCount: pathsToDelete.length };
   } catch (err) {
     console.warn('deleteEventFilesFromStorage error:', err);
     return { success: false, error: err.message };
@@ -499,7 +741,7 @@ export async function listEventPhotosFromStorage(eventSlug) {
   if (!eventSlug || !isStorageConfigured()) return [];
   try {
     const client = getSupabaseClient();
-    const { bucket } = getSupabaseConfig();
+    const { bucket } = getBaaSConfig();
     const safeSlug = eventSlug.replace(/[^a-zA-Z0-9-_]/g, '_');
 
     const { data: files, error } = await client.storage.from(bucket).list(safeSlug, {
@@ -508,13 +750,10 @@ export async function listEventPhotosFromStorage(eventSlug) {
     });
 
     if (error || !files) {
-      console.warn('Could not list files from Supabase Storage:', error);
       return [];
     }
 
-    // Filter out hidden files and directory placeholders
     const validFiles = files.filter(f => f && f.name && !f.name.startsWith('.'));
-    // Separate full photos and micro-thumbnails (thumbnails start with thumb_)
     const photoFiles = validFiles.filter(f => !f.name.startsWith('thumb_'));
 
     return photoFiles.map(file => {
@@ -531,7 +770,7 @@ export async function listEventPhotosFromStorage(eventSlug) {
 
       const origUrl = origUrlData?.publicUrl || '';
       const thumbUrl = thumbUrlData?.publicUrl || origUrl;
-      const isEncrypted = file.name.includes('.enc') || file.name.endsWith('.enc');
+      const isEncrypted = file.name.includes('.enc') || file.name.includes('.lenc');
 
       return {
         id: `supabase_${origPath}`,
@@ -541,8 +780,6 @@ export async function listEventPhotosFromStorage(eventSlug) {
         storage_thumb_url: thumbUrl,
         original_url: origUrl,
         thumb_url: thumbUrl,
-        original_path: origUrl,
-        thumbnail_path: thumbUrl,
         filename: file.name,
         is_encrypted: isEncrypted,
         created_at: file.created_at || file.updated_at || new Date().toISOString(),
@@ -557,23 +794,28 @@ export async function listEventPhotosFromStorage(eventSlug) {
 }
 
 /**
- * Sync an event manifest to Supabase Storage so the Super Admin can track it across hosts
+ * Sync an event manifest to Supabase Storage
  */
 export async function syncEventManifestToStorage(eventData, hostName = 'Host') {
   if (!eventData || !eventData.slug || !isStorageConfigured()) return;
   try {
     const client = getSupabaseClient();
-    const { bucket } = getSupabaseConfig();
+    const { bucket } = getBaaSConfig();
     const safeSlug = eventData.slug.replace(/[^a-zA-Z0-9-_]/g, '_');
     const manifest = {
       slug: eventData.slug,
       name: eventData.name,
       date: eventData.date || new Date().toISOString().split('T')[0],
       tagline: eventData.tagline || '',
-      max_photos: Number(eventData.max_photos) || 100,
-      guest_upload_limit: Number(eventData.guest_upload_limit) || 20,
+      max_photos: Number(eventData.max_photos) || EVENT_MAX_PHOTOS_LIMIT,
+      guest_upload_limit: Number(eventData.guest_upload_limit) || GUEST_MAX_PHOTOS_LIMIT,
       moderation_enabled: eventData.moderation_enabled !== false,
-      is_encrypted: Boolean(eventData.is_encrypted),
+      auto_approve: Boolean(eventData.auto_approve),
+      e2ee_enabled: Boolean(eventData.e2ee_enabled),
+      allow_guest_downloads: eventData.allow_guest_downloads !== false,
+      frame_url: eventData.frame_url || null,
+      frame_config: eventData.frame_config || { enabled: false, preset: 'none' },
+      is_encrypted: Boolean(eventData.is_encrypted || eventData.e2ee_enabled),
       admin_wrapped_key: eventData.admin_wrapped_key || null,
       status: eventData.status || 'active',
       host_name: hostName || 'Host',
@@ -591,162 +833,13 @@ export async function syncEventManifestToStorage(eventData, hostName = 'Host') {
 }
 
 /**
- * List all global events created across all GitHub hosts and local instances
- */
-export async function listAllGlobalEventsFromStorage() {
-  if (!isStorageConfigured()) return [];
-  try {
-    const client = getSupabaseClient();
-    const { bucket } = getSupabaseConfig();
-
-    // 1. Fetch active events from Supabase Database if table is available
-    let dbEventsMap = null;
-    try {
-      const { data: dbEvents, error: dbErr } = await client.from('events').select('*');
-      if (!dbErr && dbEvents && Array.isArray(dbEvents)) {
-        dbEventsMap = new Map(dbEvents.map(e => [e.slug, e]));
-      }
-    } catch (_) {}
-
-    // 2. Fetch all manifests from _events/
-    const manifestsMap = new Map();
-    try {
-      const { data: manifestList } = await client.storage.from(bucket).list('_events', {
-        limit: 200,
-      });
-
-      if (manifestList && manifestList.length > 0) {
-        await Promise.all(
-          manifestList
-            .filter(f => f && f.name && f.name.endsWith('.json') && !f.name.includes('_approved'))
-            .map(async file => {
-              try {
-                const { data: blob, error } = await client.storage.from(bucket).download(`_events/${file.name}`);
-                if (!error && blob) {
-                  const text = await blob.text();
-                  const parsed = JSON.parse(text);
-                  if (parsed && parsed.slug && parsed.status !== 'deleted') {
-                    manifestsMap.set(parsed.slug, parsed);
-                  }
-                }
-              } catch (_) {}
-            })
-        );
-      }
-    } catch (_) {}
-
-    // 3. Discover all event folders in the bucket root
-    const { data: rootItems, error: rootErr } = await client.storage.from(bucket).list('', {
-      limit: 200,
-    });
-
-    const folderSlugs = (rootItems || [])
-      .filter(item => item && item.name && !item.name.startsWith('.') && !item.name.startsWith('_'))
-      .map(item => item.name);
-
-    const dbSlugs = dbEventsMap ? Array.from(dbEventsMap.keys()) : [];
-    const allSlugs = Array.from(new Set([...manifestsMap.keys(), ...folderSlugs, ...dbSlugs]));
-
-    // 4. Scan each event folder to compute exact metrics
-    const results = (
-      await Promise.all(
-        allSlugs.map(async slug => {
-          const manifest = manifestsMap.get(slug) || {};
-          const dbEvent = dbEventsMap?.get(slug) || null;
-          const safeSlug = slug.replace(/[^a-zA-Z0-9-_]/g, '_');
-
-          let photoCount = 0;
-          let thumbCount = 0;
-          let totalBytes = 0;
-          let latestTimestamp = manifest.created_at || dbEvent?.created_at || null;
-
-          try {
-            const { data: files } = await client.storage.from(bucket).list(safeSlug, {
-              limit: 500,
-              sortBy: { column: 'created_at', order: 'desc' },
-            });
-
-            if (files && files.length > 0) {
-              const valid = files.filter(f => f && f.name && !f.name.startsWith('.'));
-              valid.forEach(f => {
-                const size = f.metadata?.size || 0;
-                totalBytes += size;
-                if (f.name.startsWith('thumb_')) {
-                  thumbCount++;
-                } else {
-                  photoCount++;
-                }
-                const fileTime = f.created_at || f.updated_at || f.metadata?.lastModified;
-                if (fileTime && (!latestTimestamp || new Date(fileTime) > new Date(latestTimestamp))) {
-                  latestTimestamp = fileTime;
-                }
-              });
-            }
-          } catch (_) {}
-
-          const hasManifest = Boolean(manifest.slug);
-          const hasDbRecord = Boolean(dbEvent);
-
-          // FILTER: If an event has 0 photos, 0 thumbs, no manifest, and no active DB record,
-          // it was purged/deleted and is merely an empty S3 prefix/ghost. Drop it.
-          if (photoCount === 0 && thumbCount === 0 && !hasManifest && !hasDbRecord) {
-            return null;
-          }
-
-          // FILTER: If an event was marked deleted in manifest
-          if (manifest.status === 'deleted') {
-            return null;
-          }
-
-          // FILTER: If events DB table is active and the event has 0 photos and is not in the DB,
-          // it was deleted from the database. Drop it.
-          if (dbEventsMap && !hasDbRecord && photoCount === 0 && thumbCount === 0) {
-            return null;
-          }
-
-          const formattedName = manifest.name || dbEvent?.name || slug
-            .split('-')
-            .map(s => s.charAt(0).toUpperCase() + s.slice(1))
-            .join(' ');
-
-          return {
-            slug,
-            name: formattedName,
-            date: manifest.date || dbEvent?.date || (latestTimestamp ? latestTimestamp.split('T')[0] : 'N/A'),
-            tagline: manifest.tagline || dbEvent?.tagline || '',
-            host_name: manifest.host_name || dbEvent?.host_name || 'Host',
-            status: manifest.status || 'active',
-            max_photos: manifest.max_photos || dbEvent?.max_photos || 100,
-            total_photos: photoCount,
-            thumb_count: thumbCount,
-            total_bytes: totalBytes,
-            storage_mb: (totalBytes / (1024 * 1024)).toFixed(2),
-            created_at: manifest.created_at || dbEvent?.created_at || latestTimestamp || new Date().toISOString(),
-            last_activity: latestTimestamp || manifest.created_at || dbEvent?.created_at || 'N/A',
-            is_encrypted: Boolean(manifest.is_encrypted),
-            admin_wrapped_key: manifest.admin_wrapped_key || null,
-            has_manifest: hasManifest,
-          };
-        })
-      )
-    ).filter(Boolean);
-
-    // Sort by latest activity / created_at descending
-    return results.sort((a, b) => new Date(b.last_activity || 0) - new Date(a.last_activity || 0));
-  } catch (err) {
-    console.warn('listAllGlobalEventsFromStorage error:', err);
-    return [];
-  }
-}
-
-/**
  * Fetch an individual event manifest from Supabase Storage (_events/${slug}.json)
  */
 export async function getEventManifestFromStorage(eventSlug) {
   if (!eventSlug || !isStorageConfigured()) return null;
   try {
     const client = getSupabaseClient();
-    const { bucket } = getSupabaseConfig();
+    const { bucket } = getBaaSConfig();
     const safeSlug = eventSlug.replace(/[^a-zA-Z0-9-_]/g, '_');
     const { data: blob, error } = await client.storage.from(bucket).download(`_events/${safeSlug}.json`);
     if (error || !blob) return null;
@@ -758,14 +851,13 @@ export async function getEventManifestFromStorage(eventSlug) {
 }
 
 /**
- * Persist the list of host-approved photo paths to Supabase Storage (_events/${slug}_approved.json)
- * so that all clients, guest devices, and hosts on separate networks stay synchronized.
+ * Save approved photo list to storage manifest
  */
 export async function syncApprovedListToStorage(eventSlug, approvedPaths) {
   if (!eventSlug || !isStorageConfigured()) return;
   try {
     const client = getSupabaseClient();
-    const { bucket } = getSupabaseConfig();
+    const { bucket } = getBaaSConfig();
     const safeSlug = eventSlug.replace(/[^a-zA-Z0-9-_]/g, '_');
     const payload = {
       slug: eventSlug,
@@ -783,13 +875,13 @@ export async function syncApprovedListToStorage(eventSlug, approvedPaths) {
 }
 
 /**
- * Fetch the list of host-approved photo paths from Supabase Storage (_events/${slug}_approved.json)
+ * Fetch approved photo list from storage manifest
  */
 export async function getApprovedListFromStorage(eventSlug) {
   if (!eventSlug || !isStorageConfigured()) return null;
   try {
     const client = getSupabaseClient();
-    const { bucket } = getSupabaseConfig();
+    const { bucket } = getBaaSConfig();
     const safeSlug = eventSlug.replace(/[^a-zA-Z0-9-_]/g, '_');
     const { data: blob, error } = await client.storage.from(bucket).download(`_events/${safeSlug}_approved.json`);
     if (error || !blob) return null;
@@ -800,15 +892,9 @@ export async function getApprovedListFromStorage(eventSlug) {
     return null;
   }
 }
-/**
- * ==============================================================================
- * Supabase Database Layer (Hosts, Event Ownership, Guests & 24h Ephemeral TTL)
- * ==============================================================================
- */
 
 /**
- * Register or verify host credentials in Supabase Database ('hosts' table)
- * Enforces 24-hour expiration lifecycle.
+ * Database Layer: Host registration & 24h expiration
  */
 export async function registerOrVerifyHostInCloud(hostName, pinHash) {
   if (!isStorageConfigured() || !hostName) return null;
@@ -816,7 +902,6 @@ export async function registerOrVerifyHostInCloud(hostName, pinHash) {
     const client = getSupabaseClient();
     const cleanHost = hostName.trim();
 
-    // Check if host already exists
     const { data: existing, error: fetchErr } = await client
       .from('hosts')
       .select('*')
@@ -824,21 +909,16 @@ export async function registerOrVerifyHostInCloud(hostName, pinHash) {
       .maybeSingle();
 
     if (fetchErr) {
-      // Table doesn't exist yet (PGRST205) or database error: log and fallback
-      console.info('Supabase Database hosts table not yet migrated or reachable:', fetchErr.message);
       return null;
     }
 
     const now = new Date();
 
     if (existing) {
-      // Check if existing host space is past 24-hour expiration
       const expiresAt = new Date(existing.expires_at);
       if (expiresAt < now) {
-        // Expired! Delete and re-register fresh 24h space
         await client.from('hosts').delete().eq('id', existing.id);
       } else {
-        // Active host: verify PIN
         if (existing.pin_hash && existing.pin_hash !== pinHash) {
           return { success: false, error: 'Incorrect Host PIN for this account.' };
         }
@@ -846,18 +926,17 @@ export async function registerOrVerifyHostInCloud(hostName, pinHash) {
           success: true,
           host: existing,
           isNew: false,
-          remainingMs: Math.max(0, expiresAt.getTime() - now.getTime())
+          remainingMs: Math.max(0, expiresAt.getTime() - now.getTime()),
         };
       }
     }
 
-    // Create fresh host space (24-hour TTL)
     const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
     const newRecord = {
       host_name: cleanHost,
       pin_hash: pinHash || '',
       created_at: now.toISOString(),
-      expires_at: expiresAt
+      expires_at: expiresAt,
     };
 
     const { data: created, error: insertErr } = await client
@@ -867,7 +946,6 @@ export async function registerOrVerifyHostInCloud(hostName, pinHash) {
       .single();
 
     if (insertErr) {
-      console.warn('Failed to insert host in Supabase DB:', insertErr.message);
       return null;
     }
 
@@ -875,7 +953,7 @@ export async function registerOrVerifyHostInCloud(hostName, pinHash) {
       success: true,
       host: created,
       isNew: true,
-      remainingMs: 24 * 60 * 60 * 1000
+      remainingMs: 24 * 60 * 60 * 1000,
     };
   } catch (err) {
     console.warn('registerOrVerifyHostInCloud error:', err);
@@ -913,8 +991,123 @@ export async function getHostDetailsFromCloud(hostName) {
 }
 
 /**
- * Create or sync event ownership in Supabase Database ('events' table)
- * Enforces 10-event quota per host and 24-hour expiration.
+ * List all global events created across all hosts from storage manifests and database
+ */
+export async function listAllGlobalEventsFromStorage() {
+  if (!isStorageConfigured()) return [];
+  try {
+    const client = getSupabaseClient();
+    const { bucket } = getBaaSConfig();
+
+    let dbEventsMap = null;
+    try {
+      const { data: dbEvents, error: dbErr } = await client.from('events').select('*');
+      if (!dbErr && dbEvents && Array.isArray(dbEvents)) {
+        dbEventsMap = new Map(dbEvents.map(e => [e.slug, e]));
+      }
+    } catch (_) {}
+
+    const manifestsMap = new Map();
+    try {
+      const { data: manifestList } = await client.storage.from(bucket).list('_events', { limit: 200 });
+      if (manifestList && manifestList.length > 0) {
+        await Promise.all(
+          manifestList
+            .filter(f => f && f.name && f.name.endsWith('.json') && !f.name.includes('_approved'))
+            .map(async file => {
+              try {
+                const { data: blob, error } = await client.storage.from(bucket).download(`_events/${file.name}`);
+                if (!error && blob) {
+                  const text = await blob.text();
+                  const parsed = JSON.parse(text);
+                  if (parsed && parsed.slug && parsed.status !== 'deleted') {
+                    manifestsMap.set(parsed.slug, parsed);
+                  }
+                }
+              } catch (_) {}
+            })
+        );
+      }
+    } catch (_) {}
+
+    const { data: rootItems } = await client.storage.from(bucket).list('', { limit: 200 });
+    const folderSlugs = (rootItems || [])
+      .filter(item => item && item.name && !item.name.startsWith('.') && !item.name.startsWith('_'))
+      .map(item => item.name);
+
+    const dbSlugs = dbEventsMap ? Array.from(dbEventsMap.keys()) : [];
+    const allSlugs = Array.from(new Set([...manifestsMap.keys(), ...folderSlugs, ...dbSlugs]));
+
+    const results = (
+      await Promise.all(
+        allSlugs.map(async slug => {
+          const manifest = manifestsMap.get(slug) || {};
+          const dbEvent = dbEventsMap?.get(slug) || null;
+          const safeSlug = slug.replace(/[^a-zA-Z0-9-_]/g, '_');
+
+          let photoCount = 0;
+          let thumbCount = 0;
+          let totalBytes = 0;
+          let latestTimestamp = manifest.created_at || dbEvent?.created_at || null;
+
+          try {
+            const { data: files } = await client.storage.from(bucket).list(safeSlug, {
+              limit: 500,
+              sortBy: { column: 'created_at', order: 'desc' },
+            });
+            if (files && files.length > 0) {
+              const valid = files.filter(f => f && f.name && !f.name.startsWith('.'));
+              valid.forEach(f => {
+                const size = f.metadata?.size || 0;
+                totalBytes += size;
+                if (f.name.startsWith('thumb_')) thumbCount++;
+                else photoCount++;
+                const fileTime = f.created_at || f.updated_at || f.metadata?.lastModified;
+                if (fileTime && (!latestTimestamp || new Date(fileTime) > new Date(latestTimestamp))) {
+                  latestTimestamp = fileTime;
+                }
+              });
+            }
+          } catch (_) {}
+
+          if (photoCount === 0 && thumbCount === 0 && !manifest.slug && !dbEvent) return null;
+          if (manifest.status === 'deleted') return null;
+
+          const formattedName = manifest.name || dbEvent?.name || slug
+            .split('-')
+            .map(s => s.charAt(0).toUpperCase() + s.slice(1))
+            .join(' ');
+
+          return {
+            slug,
+            name: formattedName,
+            date: manifest.date || dbEvent?.date || (latestTimestamp ? latestTimestamp.split('T')[0] : 'N/A'),
+            tagline: manifest.tagline || dbEvent?.tagline || '',
+            host_name: manifest.host_name || dbEvent?.host_name || 'Host',
+            status: manifest.status || 'active',
+            max_photos: manifest.max_photos || dbEvent?.max_photos || 100,
+            total_photos: photoCount,
+            thumb_count: thumbCount,
+            total_bytes: totalBytes,
+            storage_mb: (totalBytes / (1024 * 1024)).toFixed(2),
+            created_at: manifest.created_at || dbEvent?.created_at || latestTimestamp || new Date().toISOString(),
+            last_activity: latestTimestamp || manifest.created_at || dbEvent?.created_at || 'N/A',
+            is_encrypted: Boolean(manifest.is_encrypted || dbEvent?.e2ee_enabled),
+            has_manifest: Boolean(manifest.slug),
+          };
+        })
+      )
+    ).filter(Boolean);
+
+    return results.sort((a, b) => new Date(b.last_activity || 0) - new Date(a.last_activity || 0));
+  } catch (err) {
+    return [];
+  }
+}
+
+
+/**
+ * Database Layer: Create or sync event with quotas and frame config
  */
 export async function createCloudEvent(eventData, hostName) {
   if (!isStorageConfigured() || !eventData?.slug) return null;
@@ -922,14 +1115,10 @@ export async function createCloudEvent(eventData, hostName) {
     const client = getSupabaseClient();
     const cleanHost = (hostName || eventData.host_name || 'Host').trim();
 
-    // Check host's existing event count in Supabase Database
-    const { data: hostEvents, error: countErr } = await client
-      .from('events')
-      .select('slug')
-      .ilike('host_name', cleanHost);
-
-    if (!countErr && hostEvents && hostEvents.length >= 10) {
-      throw new Error('Host space quota reached (maximum 10 events allowed).');
+    // Check host quota (max 5 active events)
+    const hostQuota = await checkHostEventQuota(cleanHost, HOST_MAX_EVENTS_LIMIT);
+    if (!hostQuota.allowed) {
+      throw new Error(`Host quota reached (maximum ${HOST_MAX_EVENTS_LIMIT} concurrent active events allowed on free tier).`);
     }
 
     const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
@@ -941,10 +1130,14 @@ export async function createCloudEvent(eventData, hostName) {
       date: eventData.date || new Date().toISOString().split('T')[0],
       moderation_enabled: eventData.moderation_enabled !== false,
       auto_approve: Boolean(eventData.auto_approve),
-      guest_upload_limit: Number(eventData.guest_upload_limit) || 20,
-      max_photos: 100,
+      e2ee_enabled: Boolean(eventData.e2ee_enabled),
+      allow_guest_downloads: eventData.allow_guest_downloads !== false,
+      frame_url: eventData.frame_url || null,
+      frame_config: eventData.frame_config || { enabled: false, preset: 'none', text: '' },
+      guest_upload_limit: Number(eventData.guest_upload_limit) || GUEST_MAX_PHOTOS_LIMIT,
+      max_photos: Number(eventData.max_photos) || EVENT_MAX_PHOTOS_LIMIT,
       created_at: new Date().toISOString(),
-      expires_at: expiresAt
+      expires_at: expiresAt,
     };
 
     const { data, error } = await client
@@ -964,7 +1157,7 @@ export async function createCloudEvent(eventData, hostName) {
 }
 
 /**
- * Query active events from Supabase Database strictly belonging to a specific host
+ * Database Layer: Query active events for a specific host
  */
 export async function getCloudEventsForHost(hostName) {
   if (!isStorageConfigured() || !hostName) return null;
@@ -985,7 +1178,7 @@ export async function getCloudEventsForHost(hostName) {
 }
 
 /**
- * Delete event record from Supabase Database and cascade to Supabase Storage
+ * Database Layer: Delete event and cascade deletion
  */
 export async function deleteCloudEvent(slug) {
   if (!slug || !isStorageConfigured()) return;
@@ -1001,8 +1194,7 @@ export async function deleteCloudEvent(slug) {
 }
 
 /**
- * Register/Sync guest attendee in Supabase Database ('guests' table)
- * Ensures cross-device guest attendance and upload stats are accurately tracked.
+ * Database Layer: Register/sync guest session
  */
 export async function syncGuestToCloud(eventSlug, guestData) {
   if (!eventSlug || !guestData?.name || !isStorageConfigured()) return null;
@@ -1014,7 +1206,7 @@ export async function syncGuestToCloud(eventSlug, guestData) {
       token: guestData.token || `token_${Date.now()}`,
       upload_count: Number(guestData.upload_count) || 0,
       created_at: guestData.created_at || new Date().toISOString(),
-      last_seen: new Date().toISOString()
+      last_seen: new Date().toISOString(),
     };
 
     const { data, error } = await client
@@ -1023,9 +1215,7 @@ export async function syncGuestToCloud(eventSlug, guestData) {
       .select()
       .maybeSingle();
 
-    if (error) {
-      return null;
-    }
+    if (error) return null;
     return data;
   } catch (err) {
     return null;
@@ -1033,7 +1223,7 @@ export async function syncGuestToCloud(eventSlug, guestData) {
 }
 
 /**
- * Fetch all registered guests for an event from Supabase Database
+ * Database Layer: Fetch registered guests for an event
  */
 export async function getCloudGuestsForEvent(eventSlug) {
   if (!eventSlug || !isStorageConfigured()) return [];
@@ -1053,8 +1243,7 @@ export async function getCloudGuestsForEvent(eventSlug) {
 }
 
 /**
- * Save a photo's durable attribution and metadata. Storage files intentionally
- * contain no personal data, so this table is the cross-device source of truth.
+ * Database Layer: Save photo metadata (supports captions, frame tags, likes, status)
  */
 export async function syncPhotoToCloud(photoData) {
   if (!photoData?.event_slug || !photoData?.storage_orig_path || !isStorageConfigured()) return null;
@@ -1068,13 +1257,16 @@ export async function syncPhotoToCloud(photoData) {
       hash: photoData.hash || null,
       guest_token: photoData.guest_token || null,
       guest_name: (photoData.guest_name || 'Guest').trim() || 'Guest',
+      caption: photoData.caption || null,
+      has_frame: Boolean(photoData.has_frame),
+      likes_count: Number(photoData.likes_count) || 0,
       status: photoData.status || 'pending',
       width: Number(photoData.width) || null,
       height: Number(photoData.height) || null,
       size: Number(photoData.size) || null,
       mime_type: photoData.mime_type || 'image/jpeg',
       created_at: photoData.created_at || new Date().toISOString(),
-      updated_at: new Date().toISOString()
+      updated_at: new Date().toISOString(),
     };
     const { data, error } = await client
       .from('photos')
@@ -1083,13 +1275,13 @@ export async function syncPhotoToCloud(photoData) {
       .maybeSingle();
     return error ? null : data;
   } catch (_) {
-    // Events created before the schema migration continue to work with the
-    // legacy Storage-only fallback.
     return null;
   }
 }
 
-/** Fetch durable photo metadata for cross-device gallery hydration. */
+/**
+ * Database Layer: Fetch photos for event
+ */
 export async function getCloudPhotosForEvent(eventSlug) {
   if (!eventSlug || !isStorageConfigured()) return [];
   try {
@@ -1106,10 +1298,7 @@ export async function getCloudPhotosForEvent(eventSlug) {
 }
 
 /**
- * Automated 24-Hour Ephemeral Lifecycle Cleanup:
- * Scans for expired hosts and events (expires_at <= now()).
- * Purges associated photo folders and manifests from Supabase Storage,
- * deletes DB rows from events and guests tables.
+ * Automated 24-Hour Ephemeral Lifecycle Cleanup
  */
 export async function cleanupExpiredHostsAndEvents() {
   if (!isStorageConfigured()) return;
@@ -1117,7 +1306,6 @@ export async function cleanupExpiredHostsAndEvents() {
     const client = getSupabaseClient();
     const nowIso = new Date().toISOString();
 
-    // 1. Find expired events and purge their storage files + DB rows
     const { data: expiredEvents } = await client
       .from('events')
       .select('slug')
@@ -1125,14 +1313,12 @@ export async function cleanupExpiredHostsAndEvents() {
 
     if (expiredEvents && expiredEvents.length > 0) {
       for (const ev of expiredEvents) {
-        console.log(`[LuminaFeed TTL] Purging expired event storage assets: ${ev.slug}`);
         await deleteEventFilesFromStorage(ev.slug);
       }
       await client.from('guests').delete().in('event_slug', expiredEvents.map(e => e.slug));
       await client.from('events').delete().lte('expires_at', nowIso);
     }
 
-    // 2. Find expired hosts, purge their events' storage files, and remove host accounts
     const { data: expiredHosts } = await client
       .from('hosts')
       .select('id, host_name')
@@ -1150,11 +1336,7 @@ export async function cleanupExpiredHostsAndEvents() {
           await deleteEventFilesFromStorage(ev.slug);
         }
       }
-
-      console.log(`[LuminaFeed TTL] Purging ${expiredHosts.length} expired host account(s).`);
       await client.from('hosts').delete().lte('expires_at', nowIso);
     }
-  } catch (err) {
-    // Silent fail if tables aren't present
-  }
+  } catch (_) {}
 }

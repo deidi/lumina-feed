@@ -1,4 +1,4 @@
-const CACHE_NAME = 'luminafeed-pwa-v1.1';
+const CACHE_NAME = 'luminafeed-pwa-v0.1.0';
 const STATIC_ASSETS = [
   './',
   './index.html',

@@ -22,3 +22,7 @@ super_admin_report*
 # AI & Agent Guidelines (Local Only - Never commit to Git)
 AGENTS.md
 .agents/
+
+# Backups and local archives
+archive/
+

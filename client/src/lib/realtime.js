@@ -472,6 +472,36 @@ export function initRealtimeHub(slug, options = {}) {
       }
     },
 
+    sendReaction: (emoji, photoId = null, senderName = '') => {
+      if (isDestroyed || !emoji) return;
+      const reactionPayload = {
+        id: 'rx_' + Math.random().toString(36).substring(2, 9),
+        emoji,
+        photoId,
+        senderName: senderName || 'Guest',
+        senderId: myClientId,
+        leftPercent: 15 + Math.random() * 70, // Random horizontal drift (15% - 85%)
+        timestamp: Date.now(),
+      };
+      const msg = {
+        type: 'reaction:sent',
+        payload: reactionPayload,
+      };
+      if (client && client.connected) {
+        client.publish(
+          topicBroadcast,
+          JSON.stringify({
+            senderId: myClientId,
+            msg,
+          })
+        );
+      }
+      if (localChannel) {
+        localChannel.postMessage(msg);
+      }
+      onMessage(msg);
+    },
+
     requestGallerySync,
 
     broadcastGallery: () => {

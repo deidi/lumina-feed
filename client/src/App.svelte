@@ -19,6 +19,9 @@
     flushOfflineQueue,
   } from "./lib/offline-queue.js";
   import { db, blobToBase64, base64ToBlob } from "./lib/db.js";
+  import { cameraController } from "./lib/camera.js";
+  import { FRAME_PRESETS, renderPresetFrameToCanvas } from "./lib/frame-studio.js";
+  import { composePhotoWithFrame, renderFramedPhotoToCanvas } from "./lib/photo-engine.js";
 
   // Localhost environment check for Super Admin isolation
   const isLocalEnvironment =
@@ -206,6 +209,48 @@
   let fileInputEl = $state();
 
   let wsHandle = null;
+  let studioCanvasEl = $state(null);
+
+  // In-App Camera Viewfinder State
+  let isCameraOpen = $state(false);
+  let cameraVideoEl = $state(null);
+  let cameraFacingMode = $state("environment");
+  let isTorchOn = $state(false);
+  let hasTorch = $state(false);
+  let hasMultipleCameras = $state(false);
+  let cameraErrorMsg = $state("");
+  let isSnapping = $state(false);
+
+  // Photo Studio & Frame Preview State
+  let isPhotoStudioOpen = $state(false);
+  let studioFile = $state(null);
+  let studioPreviewBlobUrl = $state("");
+  let studioUseFrame = $state(true);
+  let studioCaption = $state("");
+  let isSubmittingStudio = $state(false);
+
+  // Floating Social Reactions State
+  let floatingReactions = $state([]);
+
+  function triggerFloatingReaction(reaction) {
+    if (!reaction || !reaction.emoji) return;
+    const item = {
+      id: reaction.id || "rx_" + Math.random().toString(36).substring(2, 9),
+      emoji: reaction.emoji,
+      senderName: reaction.senderName || "",
+      leftPercent: reaction.leftPercent || (20 + Math.random() * 60),
+    };
+    floatingReactions = [...floatingReactions, item];
+    setTimeout(() => {
+      floatingReactions = floatingReactions.filter((r) => r.id !== item.id);
+    }, 2800);
+  }
+
+  function sendPhotoReaction(emoji, photoId = null) {
+    if (wsHandle && typeof wsHandle.sendReaction === "function") {
+      wsHandle.sendReaction(emoji, photoId, guestSession?.guest?.name || "Guest");
+    }
+  }
 
   function getPhotoSrc(photo, isThumb = true) {
     if (!photo) return "";
@@ -586,6 +631,11 @@
   }
 
   function handleWebSocketMessage(msg) {
+    if (msg.type === "reaction:sent") {
+      triggerFloatingReaction(msg.payload);
+      return;
+    }
+
     if (msg.type === "event:status-changed") {
       if (guestEventData && guestEventData.slug === msg.payload.slug) {
         guestEventData.status = msg.payload.status;
@@ -2566,23 +2616,336 @@
     deferredInstallPrompt = null;
   }
 
+  // --- CAMERA & PHOTO STUDIO PIPELINE ---
+
+  async function handleStartCameraCapture() {
+    if (guestEventData?.status === "archived") {
+      alert("This event has ended and is no longer accepting new uploads.");
+      return;
+    }
+    if ((guestEventData?.total_photos || 0) >= (guestEventData?.max_photos || 100)) {
+      alert("Event photo limit reached! This event space has reached its maximum capacity of 100 pictures.");
+      return;
+    }
+    if (guestSession && guestSession.quota && guestSession.quota.remaining <= 0) {
+      alert("You have reached your upload limit for this event.");
+      return;
+    }
+
+    cameraErrorMsg = "";
+    isCameraOpen = true;
+
+    setTimeout(async () => {
+      try {
+        if (!cameraVideoEl) return;
+        const res = await cameraController.startStream(cameraVideoEl, { facingMode: cameraFacingMode });
+        hasTorch = res.hasTorch;
+        hasMultipleCameras = res.hasMultipleCameras;
+      } catch (err) {
+        console.warn("Camera start failed, falling back to native picker:", err);
+        cameraErrorMsg = err.message || "Unable to access camera";
+        handleCloseCamera();
+        cameraInputEl?.click();
+      }
+    }, 60);
+  }
+
+  function handleCloseCamera() {
+    cameraController.stopStream();
+    isCameraOpen = false;
+    isTorchOn = false;
+    cameraErrorMsg = "";
+  }
+
+  async function handleFlipCamera() {
+    try {
+      const res = await cameraController.flipCamera();
+      cameraFacingMode = res.facingMode;
+      hasTorch = cameraController.hasTorch;
+      isTorchOn = cameraController.isTorchOn;
+    } catch (err) {
+      console.warn("Flip camera error:", err);
+    }
+  }
+
+  async function handleToggleTorch() {
+    try {
+      isTorchOn = await cameraController.toggleTorch();
+    } catch (err) {
+      console.warn("Torch error:", err);
+    }
+  }
+
+  async function handleSnapPhoto() {
+    if (isSnapping) return;
+    isSnapping = true;
+    try {
+      const snap = await cameraController.takeSnapshot();
+      handleCloseCamera();
+      openPhotoStudio(snap.file);
+    } catch (err) {
+      console.error("Snap photo error:", err);
+      alert("Failed to capture photo: " + (err.message || "Unknown error"));
+    } finally {
+      isSnapping = false;
+    }
+  }
+
+  function openPhotoStudio(file) {
+    if (!file) return;
+    if (studioPreviewBlobUrl) {
+      URL.revokeObjectURL(studioPreviewBlobUrl);
+    }
+    studioFile = file;
+    studioPreviewBlobUrl = URL.createObjectURL(file);
+    const hasFrameConfigured = Boolean(
+      (guestEventData?.frame_url) ||
+      (guestEventData?.frame_config && guestEventData.frame_config.type && guestEventData.frame_config.type !== "none")
+    );
+    studioUseFrame = hasFrameConfigured;
+    studioCaption = "";
+    isPhotoStudioOpen = true;
+    setTimeout(updateStudioCanvasPreview, 40);
+  }
+
+  function updateStudioCanvasPreview() {
+    if (!studioCanvasEl || !studioPreviewBlobUrl) return;
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.src = studioPreviewBlobUrl;
+    img.onload = () => {
+      let frameConfig = null;
+      if (studioUseFrame && guestEventData) {
+        if (guestEventData.frame_config && typeof guestEventData.frame_config === "object") {
+          frameConfig = guestEventData.frame_config;
+        } else if (guestEventData.frame_url) {
+          frameConfig = { type: "custom", url: guestEventData.frame_url };
+        }
+      }
+      renderFramedPhotoToCanvas(img, frameConfig, studioCanvasEl, {
+        eventTitle: guestEventData?.name || "",
+        eventDate: guestEventData?.date || ""
+      });
+    };
+  }
+
+  function handleClosePhotoStudio() {
+    if (studioPreviewBlobUrl) {
+      URL.revokeObjectURL(studioPreviewBlobUrl);
+      studioPreviewBlobUrl = "";
+    }
+    studioFile = null;
+    isPhotoStudioOpen = false;
+    isSubmittingStudio = false;
+    studioCaption = "";
+  }
+
+  async function handleSubmitPhotoStudio() {
+    if (!studioFile || !guestSession || !currentEventSlug || isSubmittingStudio) return;
+
+    if (guestEventData?.status === "archived") {
+      alert("This event has ended and is no longer accepting new uploads.");
+      handleClosePhotoStudio();
+      return;
+    }
+
+    if ((guestEventData?.total_photos || 0) >= (guestEventData?.max_photos || 100)) {
+      alert("Event photo limit reached (100 photos maximum).");
+      handleClosePhotoStudio();
+      return;
+    }
+
+    isSubmittingStudio = true;
+    const fileToUpload = studioFile;
+    const captionText = studioCaption.trim();
+    const useFrame = studioUseFrame;
+
+    let frameConfig = null;
+    if (useFrame && guestEventData) {
+      if (guestEventData.frame_config && typeof guestEventData.frame_config === "object") {
+        frameConfig = guestEventData.frame_config;
+      } else if (guestEventData.frame_url) {
+        frameConfig = {
+          type: "custom",
+          url: guestEventData.frame_url
+        };
+      }
+    }
+
+    handleClosePhotoStudio();
+
+    await processSinglePhotoUpload(fileToUpload, {
+      frameConfig,
+      hasFrame: Boolean(useFrame && frameConfig),
+      caption: captionText
+    });
+  }
+
+  async function processSinglePhotoUpload(file, options = {}) {
+    if (!file || !guestSession || !currentEventSlug) return;
+    isUploading = true;
+    uploadTotalCount = 1;
+    uploadCurrentIndex = 1;
+    uploadProgressText = "Optimizing, framing & hashing photo...";
+    errorMsg = "";
+    successMsg = "";
+
+    try {
+      uploadProgressText = "Sending photo to Host Moderation Queue...";
+      const res = await api.uploadPhoto(
+        currentEventSlug,
+        file,
+        guestSession.guest.token,
+        options
+      );
+      guestSession.quota = res.quota;
+      guestSession.guest.upload_count = res.quota.used;
+      if (guestEventData) {
+        guestEventData.total_photos = (guestEventData.total_photos || 0) + 1;
+      }
+
+      if (res.processed) {
+        let cloudUploaded = false;
+        try {
+          uploadProgressText = "Uploading photo to Cloud Storage...";
+          const uploadRes = await storage.uploadPhotoToStorage({
+            eventSlug: currentEventSlug,
+            fileName: res.processed.filename,
+            origBlob: res.processed.originalBlob,
+            thumbBlob: res.processed.thumbBlob,
+            mimeType: res.processed.mimeType,
+          });
+
+          if (uploadRes && uploadRes.origUrl) {
+            await db.photos.update(res.photo.id, {
+              storage_orig_path: uploadRes.origPath,
+              storage_thumb_path: uploadRes.thumbPath,
+              storage_orig_url: uploadRes.origUrl,
+              storage_thumb_url: uploadRes.thumbUrl,
+              original_url: uploadRes.origUrl,
+              thumb_url: uploadRes.thumbUrl,
+              original_path: uploadRes.origUrl,
+              thumbnail_path: uploadRes.thumbUrl,
+            });
+
+            storage.syncPhotoToCloud({
+              ...res.photo,
+              event_slug: currentEventSlug,
+              guest_name: guestSession.guest.name,
+              guest_token: guestSession.guest.token,
+              storage_orig_path: uploadRes.origPath,
+              storage_thumb_path: uploadRes.thumbPath,
+              caption: options.caption || null,
+              has_frame: options.hasFrame || false,
+              status: res.photo.status,
+            }).catch(() => {});
+
+            if (wsHandle) {
+              const photoPayload = {
+                origUrl: uploadRes.origUrl,
+                thumbUrl: uploadRes.thumbUrl,
+                origPath: uploadRes.origPath,
+                thumbPath: uploadRes.thumbPath,
+                filename: res.processed.filename,
+                hash: res.processed.hash,
+                width: res.processed.width,
+                height: res.processed.height,
+                size: res.processed.size,
+                mimeType: res.processed.mimeType,
+                guest_name: guestSession.guest.name,
+                guest_token: guestSession.guest.token,
+                caption: options.caption || null,
+                has_frame: options.hasFrame || false,
+                status: res.photo.status,
+              };
+              wsHandle.notifyPhotoUploaded(photoPayload);
+
+              if (res.photo.status === "approved") {
+                wsHandle.send({
+                  type: "photo:approved",
+                  payload: {
+                    ...photoPayload,
+                    id: res.photo.id,
+                    thumb_url: uploadRes.thumbUrl,
+                    original_url: uploadRes.origUrl,
+                    storage_thumb_url: uploadRes.thumbUrl,
+                    storage_orig_url: uploadRes.origUrl,
+                  },
+                });
+              }
+            }
+            cloudUploaded = true;
+          }
+        } catch (storageErr) {
+          console.warn("Direct cloud upload failed, using preview:", storageErr);
+        }
+
+        if (!cloudUploaded && wsHandle) {
+          try {
+            uploadProgressText = "Delivering preview to Host Queue...";
+            const thumbDataUrl = await blobToBase64(res.processed.thumbBlob);
+            const fallbackPayload = {
+              origUrl: "",
+              thumbUrl: thumbDataUrl,
+              origPath: "",
+              thumbPath: "",
+              filename: res.processed.filename,
+              hash: res.processed.hash,
+              width: res.processed.width,
+              height: res.processed.height,
+              size: res.processed.size,
+              mimeType: res.processed.mimeType,
+              guest_name: guestSession.guest.name,
+              guest_token: guestSession.guest.token,
+              caption: options.caption || null,
+              has_frame: options.hasFrame || false,
+              thumbDataUrl,
+              status: res.photo.status,
+            };
+            wsHandle.notifyPhotoUploaded(fallbackPayload);
+          } catch (e) {}
+        }
+      }
+
+      successMsg = "🎉 Photo delivered to Host Moderation Queue!";
+      setTimeout(() => (successMsg = ""), 5000);
+    } catch (err) {
+      console.error("Upload error:", err);
+      errorMsg = err.message || "Failed to upload photo";
+    } finally {
+      isUploading = false;
+      uploadTotalCount = 0;
+      uploadCurrentIndex = 0;
+      uploadProgressText = "";
+      if (currentEventSlug && guestSession?.guest?.token) {
+        await loadMyUploads(currentEventSlug, guestSession.guest.token);
+      }
+    }
+  }
+
   // --- PHOTO UPLOAD & DELETE LOGIC ---
   async function handleFileSelect(e) {
     const files = Array.from(e.target.files || []);
     if (!files.length || !guestSession || !currentEventSlug) return;
+    e.target.value = "";
 
     if (guestEventData?.status === "archived") {
       alert("This event has ended and is no longer accepting new uploads.");
-      e.target.value = "";
       return;
     }
 
     if ((guestEventData?.total_photos || 0) >= (guestEventData?.max_photos || 100)) {
       alert("Event photo limit reached! This event space has reached its maximum capacity of 100 pictures.");
-      e.target.value = "";
       return;
     }
 
+    // If single photo selected, open Photo Studio for preview, framing & captioning
+    if (files.length === 1) {
+      openPhotoStudio(files[0]);
+      return;
+    }
+
+    // Batch upload for multiple photos
     isUploading = true;
     uploadTotalCount = files.length;
     uploadCurrentIndex = 0;
@@ -2629,7 +2992,7 @@
           if (res.processed) {
             let cloudUploaded = false;
 
-            // 1. Direct Supabase Cloud Storage Upload (Sub-second global CDN)
+            // 1. Direct Supabase Cloud Storage Upload
             try {
               uploadProgressText = `Uploading photo ${i + 1} of ${files.length} to Cloud Storage...`;
               const uploadRes = await storage.uploadPhotoToStorage({
@@ -2641,7 +3004,6 @@
               });
 
               if (uploadRes && uploadRes.origUrl) {
-                // Update photo record with Supabase public CDN URLs
                 await db.photos.update(res.photo.id, {
                   storage_orig_path: uploadRes.origPath,
                   storage_thumb_path: uploadRes.thumbPath,
@@ -2653,8 +3015,6 @@
                   thumbnail_path: uploadRes.thumbUrl,
                 });
 
-                // Storage retains only image bytes. Persist the author and
-                // photo metadata separately so any device can restore it.
                 storage.syncPhotoToCloud({
                   ...res.photo,
                   event_slug: currentEventSlug,
@@ -2703,7 +3063,7 @@
               console.warn("Direct Supabase cloud upload failed, using fallback preview:", storageErr);
             }
 
-            // 2. Fallback (local signaling if storage unreachable): send micro-thumbnail
+            // 2. Fallback
             if (!cloudUploaded && wsHandle) {
               try {
                 uploadProgressText = `Delivering preview ${i + 1} of ${files.length} to Host Queue...`;
@@ -2769,10 +3129,9 @@
       }
     }
 
-    e.target.value = "";
     isUploading = false;
-    uploadCurrentIndex = 0;
     uploadTotalCount = 0;
+    uploadCurrentIndex = 0;
     uploadProgressText = "";
 
     await refreshOfflineQueueCount();
@@ -3139,6 +3498,7 @@
   });
 
   onDestroy(() => {
+    cameraController.stopStream();
     if (wsHandle) {
       wsHandle.disconnect();
     }
@@ -3152,6 +3512,23 @@
 </script>
 
 <div class="app-container {isSlideshowRoute ? 'slideshow-mode-container' : ''}">
+  <!-- FLOATING REAL-TIME SOCIAL REACTIONS OVERLAY -->
+  {#if floatingReactions.length > 0}
+    <div class="floating-reactions-container" aria-hidden="true">
+      {#each floatingReactions as reaction (reaction.id)}
+        <div
+          class="floating-reaction-item"
+          style="left: {reaction.leftPercent}%;"
+        >
+          <span class="floating-emoji">{reaction.emoji}</span>
+          {#if reaction.senderName && reaction.senderName !== "Guest"}
+            <span class="floating-sender">{reaction.senderName}</span>
+          {/if}
+        </div>
+      {/each}
+    </div>
+  {/if}
+
   <!-- TOP HEADER (Hidden in Slideshow / TV Mode) -->
   {#if !isSlideshowRoute}
     <header class="app-header">
@@ -3406,12 +3783,16 @@
             {/if}
           </div>
         {:else}
-          <!-- ACTIVE PHOTO DISPLAY -->
+          <!-- ACTIVE PHOTO DISPLAY WITH AMBIENT BLURRED BACKDROP -->
           {#key currentSlideIndex}
             <div
               class="slide-item-wrapper transition-{slideshowConfig.transition ||
                 'fade'}"
             >
+              <div
+                class="slide-backdrop-blur"
+                style="background-image: url('{getPhotoSrc(slideshowPhotos[currentSlideIndex], false)}');"
+              ></div>
               <img
                 src={getPhotoSrc(slideshowPhotos[currentSlideIndex], false)}
                 alt="Slideshow memory"
@@ -3420,14 +3801,19 @@
             </div>
           {/key}
 
-          <!-- AUTHOR WATERMARK (Subtle) -->
-          {#if slideshowConfig.show_author && slideshowPhotos[currentSlideIndex]?.guest_name}
-            <div class="slideshow-author-badge">
-              <span
-                >📸 Captured by <strong
-                  >{slideshowPhotos[currentSlideIndex].guest_name}</strong
-                ></span
-              >
+          <!-- CAPTION & AUTHOR GLASSMORPHISM BANNER -->
+          {#if slideshowPhotos[currentSlideIndex]?.caption || (slideshowConfig.show_author && slideshowPhotos[currentSlideIndex]?.guest_name)}
+            <div class="slideshow-info-banner">
+              {#if slideshowPhotos[currentSlideIndex]?.caption}
+                <div class="slideshow-caption">
+                  "{slideshowPhotos[currentSlideIndex].caption}"
+                </div>
+              {/if}
+              {#if slideshowConfig.show_author && slideshowPhotos[currentSlideIndex]?.guest_name}
+                <div class="slideshow-author">
+                  <span>📸 Captured by <strong>{slideshowPhotos[currentSlideIndex].guest_name}</strong></span>
+                </div>
+              {/if}
             </div>
           {/if}
 
@@ -3458,6 +3844,11 @@
             </div>
           {/if}
 
+          <!-- SLIDE COUNTER PILL -->
+          <div class="slideshow-counter-pill">
+            <span>{currentSlideIndex + 1} / {slideshowPhotos.length}</span>
+          </div>
+
           <!-- FLOATING CONTROLS (Hover) -->
           <div class="slideshow-controls-overlay">
             <button
@@ -3470,7 +3861,7 @@
             <button
               class="slide-ctrl-btn"
               onclick={prevSlide}
-              title="Previous photo (&larr;)"
+              title="Previous photo (←)"
             >
               &#10094;
             </button>
@@ -3484,7 +3875,7 @@
             <button
               class="slide-ctrl-btn"
               onclick={nextSlide}
-              title="Next photo (&rarr;)"
+              title="Next photo (→)"
             >
               &#10095;
             </button>
@@ -3502,6 +3893,23 @@
             >
               &times;
             </button>
+          </div>
+        {/if}
+
+        <!-- FLOATING REAL-TIME REACTIONS OVERLAY (SLIDESHOW) -->
+        {#if floatingReactions.length > 0}
+          <div class="floating-reactions-layer slideshow-reactions-layer" aria-hidden="true">
+            {#each floatingReactions as r (r.id)}
+              <div
+                class="floating-reaction-item"
+                style="left: {r.leftPercent}%;"
+              >
+                <span class="floating-emoji">{r.emoji}</span>
+                {#if r.senderName}
+                  <span class="floating-sender">{r.senderName}</span>
+                {/if}
+              </div>
+            {/each}
           </div>
         {/if}
       </div>
@@ -3681,7 +4089,7 @@
                     guestSession.quota.remaining <= 0 ||
                     guestEventData.status === "archived" ||
                     (guestEventData.total_photos || 0) >= (guestEventData.max_photos || 100)}
-                  onclick={() => cameraInputEl?.click()}
+                  onclick={handleStartCameraCapture}
                 >
                   <span>📷</span>
                   {guestEventData.status === "archived"
@@ -3871,7 +4279,7 @@
                   <div style="margin-top: 1.25rem;">
                     <button
                       class="btn-primary"
-                      onclick={() => cameraInputEl?.click()}
+                      onclick={handleStartCameraCapture}
                     >
                       <span>📷</span> Take Photo
                     </button>
@@ -3914,6 +4322,23 @@
                       <span class="gallery-author"
                         >📸 {photo.guest_name || "Guest"}</span
                       >
+                      {#if photo.caption}
+                        <span class="gallery-card-caption">"{photo.caption}"</span>
+                      {/if}
+                    </div>
+
+                    <!-- Quick Floating Reactions on Card -->
+                    <div class="gallery-card-reactions" onclick={(e) => e.stopPropagation()}>
+                      {#each ["❤️", "🔥", "🥂", "🎉"] as emoji}
+                        <button
+                          type="button"
+                          class="card-reaction-btn"
+                          onclick={() => sendPhotoReaction(emoji, photo.id)}
+                          title="Send {emoji}"
+                        >
+                          {emoji}
+                        </button>
+                      {/each}
                     </div>
                   </div>
                 {/each}
@@ -5884,6 +6309,221 @@
     </div>
   {/if}
 
+  <!-- IN-APP CAMERA VIEWFINDER MODAL -->
+  {#if isCameraOpen}
+    <div class="camera-modal-backdrop" role="dialog" aria-modal="true">
+      <div class="camera-viewport-container">
+        <!-- Live Camera Stream -->
+        <!-- svelte-ignore a11y_media_has_caption -->
+        <video
+          bind:this={cameraVideoEl}
+          autoplay
+          playsinline
+          muted
+          class="camera-live-video"
+        ></video>
+
+        <!-- Live Frame Overlay Preview on Camera -->
+        {#if guestEventData?.frame_url}
+          <img
+            src={guestEventData.frame_url}
+            alt="Live frame overlay"
+            class="camera-live-frame-overlay"
+          />
+        {:else if guestEventData?.frame_config && guestEventData.frame_config.type === "preset"}
+          <div class="camera-preset-frame-overlay preset-{guestEventData.frame_config.presetId || 'polaroid'}">
+            {#if guestEventData.frame_config.presetId === "polaroid"}
+              <div class="polaroid-overlay-chin">
+                <span class="polaroid-chin-title">{guestEventData.frame_config.text || guestEventData.name}</span>
+                {#if guestEventData.frame_config.subText || guestEventData.date}
+                  <span class="polaroid-chin-sub">{guestEventData.frame_config.subText || guestEventData.date}</span>
+                {/if}
+              </div>
+            {/if}
+          </div>
+        {/if}
+
+        <!-- Top Navigation Bar -->
+        <div class="camera-top-bar">
+          <button
+            type="button"
+            class="camera-icon-btn"
+            onclick={handleCloseCamera}
+            title="Close Camera"
+          >
+            ✕
+          </button>
+          <div class="camera-top-actions">
+            {#if hasTorch}
+              <button
+                type="button"
+                class="camera-icon-btn {isTorchOn ? 'active' : ''}"
+                onclick={handleToggleTorch}
+                title="Toggle Flashlight"
+              >
+                {isTorchOn ? "🔦" : "⚡"}
+              </button>
+            {/if}
+            {#if hasMultipleCameras}
+              <button
+                type="button"
+                class="camera-icon-btn"
+                onclick={handleFlipCamera}
+                title="Flip Camera"
+              >
+                🔄
+              </button>
+            {/if}
+          </div>
+        </div>
+
+        <!-- Bottom Shutter & Gallery Bar -->
+        <div class="camera-bottom-bar">
+          <button
+            type="button"
+            class="camera-icon-btn"
+            onclick={() => {
+              handleCloseCamera();
+              fileInputEl?.click();
+            }}
+            title="Open Camera Roll"
+          >
+            🖼️
+          </button>
+          <button
+            type="button"
+            class="camera-shutter-btn"
+            onclick={handleSnapPhoto}
+            disabled={isSnapping}
+            title="Take Photo"
+          >
+            <div class="camera-shutter-inner"></div>
+          </button>
+          <div style="width: 44px;"></div>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  <!-- PHOTO STUDIO PREVIEW & CAPTION MODAL -->
+  {#if isPhotoStudioOpen && studioFile}
+    <div class="modal-backdrop" role="dialog" aria-modal="true">
+      <!-- svelte-ignore a11y_click_events_have_key_events -->
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
+      <div class="modal-card photo-studio-card" onclick={(e) => e.stopPropagation()}>
+        <div class="modal-header">
+          <div style="display: flex; align-items: center; gap: 0.5rem;">
+            <span style="font-size: 1.25rem;">✨</span>
+            <h3 style="margin: 0;">Photo Studio</h3>
+          </div>
+          <button class="close-btn" onclick={handleClosePhotoStudio}>&times;</button>
+        </div>
+
+        <div class="photo-studio-body" style="padding: 1rem 1.25rem;">
+          <!-- Preview Canvas / Image -->
+          <div class="photo-studio-preview-wrapper">
+            {#if studioUseFrame && (guestEventData?.frame_url || (guestEventData?.frame_config && guestEventData.frame_config.type !== "none"))}
+              <canvas
+                bind:this={studioCanvasEl}
+                width="600"
+                height="750"
+                class="photo-studio-canvas-preview"
+              ></canvas>
+            {:else}
+              <img
+                src={studioPreviewBlobUrl}
+                alt="Raw capture preview"
+                class="photo-studio-raw-img"
+              />
+            {/if}
+          </div>
+
+          <!-- Framing Toggle -->
+          {#if guestEventData?.frame_url || (guestEventData?.frame_config && guestEventData.frame_config.type !== "none")}
+            <div class="photo-studio-frame-toggle-row">
+              <span class="toggle-label">Framing:</span>
+              <div class="frame-toggle-pills">
+                <button
+                  type="button"
+                  class="frame-toggle-btn {studioUseFrame ? 'active' : ''}"
+                  onclick={() => {
+                    studioUseFrame = true;
+                    setTimeout(updateStudioCanvasPreview, 40);
+                  }}
+                >
+                  🖼️ Framed Photo
+                </button>
+                <button
+                  type="button"
+                  class="frame-toggle-btn {!studioUseFrame ? 'active' : ''}"
+                  onclick={() => {
+                    studioUseFrame = false;
+                  }}
+                >
+                  📷 Direct Photo (No Frame)
+                </button>
+              </div>
+            </div>
+          {/if}
+
+          <!-- Optional 1-Line Caption Section -->
+          <div class="photo-studio-caption-section">
+            <div class="caption-label">
+              <span>Add a Caption (Optional)</span>
+              <span class="caption-char-count">{studioCaption.length}/120</span>
+            </div>
+            <div class="caption-input-wrapper">
+              <input
+                type="text"
+                maxlength="120"
+                placeholder="Write a message or wish for the event... ✨"
+                bind:value={studioCaption}
+                class="studio-caption-input"
+              />
+              <div class="caption-quick-emojis">
+                {#each ["❤️", "🔥", "🥂", "🎉", "✨", "🥳"] as emoji}
+                  <button
+                    type="button"
+                    class="quick-emoji-btn"
+                    onclick={() => {
+                      if (studioCaption.length + emoji.length <= 120) {
+                        studioCaption = (studioCaption ? studioCaption + " " : "") + emoji;
+                      }
+                    }}
+                  >
+                    {emoji}
+                  </button>
+                {/each}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Footer Actions -->
+        <div class="modal-footer" style="padding: 1rem 1.25rem; display: flex; gap: 0.75rem; border-top: 1px solid var(--color-border);">
+          <button
+            type="button"
+            class="btn-secondary"
+            disabled={isSubmittingStudio}
+            onclick={handleClosePhotoStudio}
+            style="flex: 1;"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            class="btn-primary"
+            disabled={isSubmittingStudio}
+            onclick={handleSubmitPhotoStudio}
+            style="flex: 2;"
+          >
+            <span>🚀</span> {isSubmittingStudio ? "Processing & Uploading..." : "Share to Live Feed"}
+          </button>
+        </div>
+      </div>
+    </div>
+  {/if}
+
   <!-- PHOTO PREVIEW LIGHTBOX -->
   {#if selectedPreviewPhoto}
     <div
@@ -5933,6 +6573,26 @@
             alt="Full resolution capture"
             class="lightbox-img"
           />
+        </div>
+
+        {#if selectedPreviewPhoto.caption}
+          <div class="lightbox-caption-box">
+            <p>"{selectedPreviewPhoto.caption}"</p>
+          </div>
+        {/if}
+
+        <div class="lightbox-reactions-row">
+          <span class="lightbox-reactions-label">React:</span>
+          {#each ["❤️", "🔥", "🥂", "🎉", "✨", "🥳"] as emoji}
+            <button
+              type="button"
+              class="quick-emoji-btn"
+              onclick={() => sendPhotoReaction(emoji, selectedPreviewPhoto.id)}
+              title="React {emoji}"
+            >
+              {emoji}
+            </button>
+          {/each}
         </div>
 
         <div class="lightbox-footer">
@@ -6590,6 +7250,23 @@
       </div>
     </div>
   {/if}
+
+  <!-- GLOBAL FLOATING SOCIAL REACTIONS OVERLAY -->
+  {#if !isSlideshowRoute && floatingReactions.length > 0}
+    <div class="floating-reactions-layer" aria-hidden="true">
+      {#each floatingReactions as r (r.id)}
+        <div
+          class="floating-reaction-item"
+          style="left: {r.leftPercent}%;"
+        >
+          <span class="floating-emoji">{r.emoji}</span>
+          {#if r.senderName}
+            <span class="floating-sender">{r.senderName}</span>
+          {/if}
+        </div>
+      {/each}
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -6771,19 +7448,34 @@
     display: flex;
     align-items: center;
     justify-content: center;
+    overflow: hidden;
+  }
+
+  .slide-backdrop-blur {
+    position: absolute;
+    inset: -30px;
+    background-size: cover;
+    background-position: center;
+    filter: blur(50px) brightness(0.35) saturate(1.4);
+    transform: scale(1.15);
+    pointer-events: none;
+    z-index: 1;
   }
 
   .slide-img {
-    max-width: 100%;
-    max-height: 100%;
+    position: relative;
+    z-index: 2;
+    max-width: 100vw;
+    max-height: 100vh;
     width: 100%;
     height: 100%;
     object-fit: contain;
+    box-shadow: 0 12px 48px rgba(0, 0, 0, 0.75);
   }
 
   /* Transition Animations */
   .transition-fade {
-    animation: fadeIn 0.8s ease-in-out;
+    animation: fadeIn 0.9s ease-in-out;
   }
 
   .transition-slide {
@@ -6791,7 +7483,7 @@
   }
 
   .transition-zoom {
-    animation: kenBurns 6s ease-out forwards;
+    animation: kenBurns 7s ease-out forwards;
   }
 
   @keyframes fadeIn {
@@ -6828,6 +7520,45 @@
     }
   }
 
+  .slideshow-info-banner {
+    position: absolute;
+    bottom: 2.5rem;
+    left: 2.5rem;
+    max-width: min(650px, calc(100vw - 220px));
+    background: rgba(15, 23, 42, 0.75);
+    backdrop-filter: blur(16px);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    padding: 0.85rem 1.35rem;
+    border-radius: var(--radius-lg);
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+    z-index: 10;
+    pointer-events: none;
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    animation: fadeIn 0.5s ease-out;
+  }
+
+  .slideshow-caption {
+    font-size: 1.25rem;
+    font-weight: 600;
+    color: #f8fafc;
+    line-height: 1.4;
+    word-break: break-word;
+  }
+
+  .slideshow-author {
+    font-size: 0.9375rem;
+    color: #cbd5e1;
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+  }
+
+  .slideshow-author strong {
+    color: #38bdf8;
+  }
+
   .slideshow-author-badge {
     position: absolute;
     bottom: 2rem;
@@ -6844,29 +7575,51 @@
 
   .slideshow-qr-pip {
     position: absolute;
-    bottom: 2rem;
-    right: 2rem;
+    bottom: 2.5rem;
+    right: 2.5rem;
     background: rgba(255, 255, 255, 0.95);
-    padding: 0.75rem;
+    padding: 0.85rem;
     border-radius: var(--radius-lg);
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+    box-shadow: 0 12px 36px rgba(0, 0, 0, 0.6);
     text-align: center;
     z-index: 10;
     pointer-events: none;
+    animation: fadeIn 0.5s ease-out;
   }
 
   .pip-qr-img {
-    width: 130px;
-    height: 130px;
+    width: 140px;
+    height: 140px;
     display: block;
+    border-radius: var(--radius-sm);
   }
 
   .pip-label {
     display: block;
-    font-size: 0.75rem;
+    font-size: 0.8125rem;
     font-weight: 700;
-    color: #111827;
-    margin-top: 0.375rem;
+    color: #0f172a;
+    margin-top: 0.45rem;
+    letter-spacing: 0.02em;
+  }
+
+  .slideshow-counter-pill {
+    position: absolute;
+    top: 1.5rem;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(15, 23, 42, 0.7);
+    backdrop-filter: blur(8px);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    color: #cbd5e1;
+    font-size: 0.875rem;
+    font-weight: 700;
+    padding: 0.4rem 1rem;
+    border-radius: 9999px;
+    z-index: 15;
+    pointer-events: none;
+    user-select: none;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
   }
 
   .slideshow-controls-overlay {
@@ -6876,7 +7629,7 @@
     display: flex;
     gap: 0.75rem;
     opacity: 0;
-    transition: opacity 0.2s ease;
+    transition: opacity 0.25s ease;
     z-index: 20;
   }
 
@@ -6888,19 +7641,21 @@
     width: 44px;
     height: 44px;
     border-radius: 50%;
-    background: rgba(0, 0, 0, 0.6);
+    background: rgba(15, 23, 42, 0.75);
     color: white;
     font-size: 1.25rem;
     display: flex;
     align-items: center;
     justify-content: center;
     cursor: pointer;
-    backdrop-filter: blur(4px);
+    backdrop-filter: blur(6px);
     border: 1px solid rgba(255, 255, 255, 0.2);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
   }
 
   .slide-ctrl-btn:hover {
-    background: rgba(37, 99, 235, 0.9);
+    background: rgba(37, 99, 235, 0.95);
+    transform: scale(1.05);
   }
 
   .slideshow-cloud-pill {
@@ -6936,6 +7691,77 @@
     background: #38bdf8;
     box-shadow: 0 0 10px #38bdf8;
     animation: pulse 1s infinite;
+  }
+
+  /* Floating Social Reactions Layer */
+  .floating-reactions-layer {
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 999;
+    overflow: hidden;
+  }
+
+  .slideshow-reactions-layer {
+    position: absolute;
+    z-index: 30;
+  }
+
+  .floating-reaction-item {
+    position: absolute;
+    bottom: 30px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+    pointer-events: none;
+    animation: floatUpReaction 2.8s cubic-bezier(0.2, 0.8, 0.2, 1) forwards;
+  }
+
+  .floating-emoji {
+    font-size: clamp(2.5rem, 5vw, 4rem);
+    filter: drop-shadow(0 6px 12px rgba(0, 0, 0, 0.45));
+    animation: wobbleEmoji 2.8s ease-in-out infinite alternate;
+  }
+
+  .floating-sender {
+    font-size: 0.8125rem;
+    font-weight: 700;
+    color: #ffffff;
+    background: rgba(15, 23, 42, 0.75);
+    backdrop-filter: blur(6px);
+    padding: 0.2rem 0.6rem;
+    border-radius: 9999px;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    box-shadow: 0 4px 10px rgba(0, 0, 0, 0.3);
+    white-space: nowrap;
+  }
+
+  @keyframes floatUpReaction {
+    0% {
+      opacity: 0;
+      transform: translateY(20px) scale(0.6);
+    }
+    15% {
+      opacity: 1;
+      transform: translateY(-40px) scale(1.15);
+    }
+    30% {
+      transform: translateY(-120px) scale(1);
+    }
+    70% {
+      opacity: 0.95;
+      transform: translateY(-380px) scale(1);
+    }
+    100% {
+      opacity: 0;
+      transform: translateY(-600px) scale(0.9);
+    }
+  }
+
+  @keyframes wobbleEmoji {
+    0% { transform: rotate(-8deg); }
+    100% { transform: rotate(8deg); }
   }
 
   @keyframes spin {

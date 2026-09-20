@@ -47,6 +47,17 @@ db.version(3).stores({
   sync_logs: '++id, event_slug, photo_id, status, error, timestamp'
 });
 
+db.version(4).stores({
+  settings: '++id, host_name, pin_hash',
+  events: '++id, slug, name, host_name, date, tagline, moderation_enabled, auto_approve, e2ee_enabled, allow_guest_downloads, frame_url, frame_config, guest_upload_limit, max_photos, status, is_encrypted, encryption_key, created_at',
+  guests: '++id, event_slug, name, token, upload_count, created_at, last_seen, [event_slug+token]',
+  photos: '++id, event_slug, guest_id, guest_name, guest_token, caption, has_frame, likes_count, hash, status, is_encrypted, created_at, [event_slug+status], [event_slug+hash], [event_slug+guest_token]',
+  guest_sessions: '++id, event_slug, name, token, upload_count, last_seen, [event_slug+token]',
+  baas_settings: '++id, key, url, anon_key, bucket, is_custom, created_at',
+  sync_logs: '++id, event_slug, photo_id, status, error, timestamp'
+});
+
+
 export function blobToBase64(blob) {
   if (!blob) return Promise.resolve('');
   return new Promise((resolve, reject) => {
@@ -340,20 +351,20 @@ export async function createEvent(data, hostName = '') {
   const resolvedHost = (hostName || data.host_name || '').trim();
   const cleanHost = resolvedHost.toLowerCase();
 
-  // Enforce 10-event quota per host space
+  // Enforce 5-event quota per host space (Free Tier Protection)
   const currentEvents = await db.events.toArray();
   const hostEvents = cleanHost 
     ? currentEvents.filter(e => !e.host_name || e.host_name.trim().toLowerCase() === cleanHost)
     : currentEvents;
 
-  if (hostEvents.length >= 10) {
-    throw new Error('Maximum limit of 10 events reached. Please delete an existing event before creating a new one.');
+  if (hostEvents.length >= 5) {
+    throw new Error('Maximum limit of 5 concurrent events reached. Please delete an existing event before creating a new one.');
   }
 
   const slug = await getUniqueSlug(name);
   const now = new Date().toISOString();
 
-  const isEncrypted = Boolean(data.is_encrypted);
+  const isEncrypted = Boolean(data.is_encrypted || data.e2ee_enabled);
   let encryptionKey = (data.encryption_key || '').trim();
   let adminWrappedKey = '';
 
@@ -372,9 +383,14 @@ export async function createEvent(data, hostName = '') {
     name,
     host_name: resolvedHost || 'Host',
     date: data.date || now.split('T')[0],
-    tagline: data.tagline || '',
-    moderation_enabled: Boolean(data.moderation_enabled),
-    guest_upload_limit: Math.min(100, Math.max(1, parseInt(data.guest_upload_limit, 10) || 20)),
+    tagline: data.tagline || 'Memories Shared in Real-Time',
+    moderation_enabled: data.moderation_enabled !== false,
+    auto_approve: Boolean(data.auto_approve),
+    e2ee_enabled: isEncrypted,
+    allow_guest_downloads: data.allow_guest_downloads !== false,
+    frame_url: data.frame_url || null,
+    frame_config: data.frame_config || { enabled: false, preset: 'none', text: '' },
+    guest_upload_limit: Math.min(100, Math.max(1, parseInt(data.guest_upload_limit, 10) || 15)),
     max_photos: 100,
     exif_strip: Boolean(data.exif_strip),
     is_encrypted: isEncrypted,
@@ -390,7 +406,7 @@ export async function createEvent(data, hostName = '') {
 }
 
 /**
- * Update event settings (e.g. upload limit, moderation, tagline)
+ * Update event settings (e.g. upload limit, moderation, frame config, tagline)
  */
 export async function updateEvent(slug, updates = {}) {
   const event = await db.events.where('slug').equals(slug).first();
@@ -400,14 +416,20 @@ export async function updateEvent(slug, updates = {}) {
   if (updates.name !== undefined) patch.name = updates.name.trim();
   if (updates.tagline !== undefined) patch.tagline = updates.tagline.trim();
   if (updates.guest_upload_limit !== undefined) {
-    patch.guest_upload_limit = Math.min(100, Math.max(1, Number(updates.guest_upload_limit) || 20));
+    patch.guest_upload_limit = Math.min(100, Math.max(1, Number(updates.guest_upload_limit) || 15));
   }
   if (updates.moderation_enabled !== undefined) patch.moderation_enabled = Boolean(updates.moderation_enabled);
+  if (updates.auto_approve !== undefined) patch.auto_approve = Boolean(updates.auto_approve);
+  if (updates.e2ee_enabled !== undefined) patch.e2ee_enabled = Boolean(updates.e2ee_enabled);
+  if (updates.allow_guest_downloads !== undefined) patch.allow_guest_downloads = Boolean(updates.allow_guest_downloads);
+  if (updates.frame_url !== undefined) patch.frame_url = updates.frame_url;
+  if (updates.frame_config !== undefined) patch.frame_config = updates.frame_config;
   if (updates.exif_strip !== undefined) patch.exif_strip = Boolean(updates.exif_strip);
   patch.max_photos = 100;
 
   await db.events.update(event.id, patch);
   const updated = await db.events.get(event.id);
+  createCloudEvent(updated, updated.host_name).catch(() => {});
   return { success: true, event: updated };
 }
 
@@ -572,10 +594,12 @@ export async function joinEvent(slug, name) {
 
   localStorage.setItem(`luminafeed_guest_${slug}`, token);
   localStorage.setItem(`caps_guest_${slug}`, token);
+  saveLocalGuestSession(slug, guestRecord.name, token).catch(() => {});
   syncGuestToCloud(slug, guestRecord).catch(() => {});
 
   const eventLimit = Number(event.max_photos) || 100;
-  const limit = Math.min(Number(event.guest_upload_limit) || 20, eventLimit);
+  const limit = Math.min(Number(event.guest_upload_limit) || 15, eventLimit);
+
   const used = Number(guestRecord.upload_count) || 0;
   const guestRemaining = Math.max(0, limit - used);
   const eventRemaining = Math.max(0, eventLimit - allEventPhotos.length);
@@ -672,7 +696,7 @@ export async function getGuestSession(slug, guestToken) {
 /**
  * Upload & process photo client-side (enforcing 100 photos limit per event)
  */
-export async function uploadPhoto(slug, file, guestToken) {
+export async function uploadPhoto(slug, file, guestToken, options = {}) {
   const event = await db.events.where('slug').equals(slug).first();
   if (!event) throw new Error('Event not found');
   if (event.status === 'archived') throw new Error('Event is archived. Uploads are disabled.');
@@ -698,18 +722,22 @@ export async function uploadPhoto(slug, file, guestToken) {
 
   // Check guest quota
   if (!isHost && guest) {
-    if (guest.upload_count >= event.guest_upload_limit) {
-      throw new Error(`Upload limit reached (${event.guest_upload_limit} photos). Delete earlier photos to free up slots.`);
+    const guestLimit = Number(event.guest_upload_limit) || 15;
+    if (guest.upload_count >= guestLimit) {
+      throw new Error(`Upload limit reached (${guestLimit} photos). Delete earlier photos to free up slots.`);
     }
   }
 
-  // Process photo client-side (resizing, thumbnails, duplicate hash, EXIF stripping)
+  // Process photo client-side (resizing, thumbnails, duplicate hash, EXIF stripping, frame compositing)
   const processed = await processPhotoClient(file, {
     maxDimension: 2048,
     thumbDimension: 360,
     quality: 0.88,
     thumbQuality: 0.75,
-    stripExif: event.exif_strip !== false
+    stripExif: event.exif_strip !== false,
+    frameConfig: options.frameConfig || null,
+    eventTitle: event.name,
+    eventDate: event.date,
   });
 
   // Duplicate check
@@ -718,7 +746,7 @@ export async function uploadPhoto(slug, file, guestToken) {
     throw new Error('This photo has already been uploaded to this event.');
   }
 
-  const initialStatus = (!event || !event.moderation_enabled || isHost) ? 'approved' : 'pending';
+  const initialStatus = (!event || !event.moderation_enabled || isHost || event.auto_approve) ? 'approved' : 'pending';
   const now = new Date().toISOString();
 
   const photoRecord = {
@@ -726,6 +754,9 @@ export async function uploadPhoto(slug, file, guestToken) {
     guest_id: guest ? guest.id : null,
     guest_name: isHost ? 'Host' : (guest ? guest.name : 'Guest'),
     guest_token: guest ? guest.token : null,
+    caption: options.caption || null,
+    has_frame: Boolean(options.hasFrame),
+    likes_count: 0,
     filename: processed.filename,
     hash: processed.hash,
     status: initialStatus,
@@ -739,6 +770,7 @@ export async function uploadPhoto(slug, file, guestToken) {
   };
 
   const id = await db.photos.add(photoRecord);
+
 
   if (guest) {
     await db.guests.update(guest.id, {
@@ -1286,3 +1318,58 @@ export async function getGuests(slug) {
 
   return { success: true, guests: guestList };
 }
+
+/**
+ * Persist guest session locally in localStorage & Dexie guest_sessions table
+ */
+export async function saveLocalGuestSession(slug, name, token) {
+  if (!slug || !token) return;
+  const sessionKey = `guest_session_${slug}`;
+  const record = {
+    event_slug: slug,
+    name: (name || 'Guest').trim(),
+    token: token.trim(),
+    last_seen: new Date().toISOString()
+  };
+  localStorage.setItem(sessionKey, JSON.stringify(record));
+  try {
+    const existing = await db.guest_sessions.where('[event_slug+token]').equals([slug, token]).first();
+    if (existing) {
+      await db.guest_sessions.update(existing.id, record);
+    } else {
+      await db.guest_sessions.add(record);
+    }
+  } catch (_) {}
+}
+
+/**
+ * Retrieve persisted guest session locally
+ */
+export async function getLocalGuestSession(slug) {
+  if (!slug) return null;
+  const sessionKey = `guest_session_${slug}`;
+  const raw = localStorage.getItem(sessionKey);
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && parsed.name && parsed.token) return parsed;
+    } catch (_) {}
+  }
+  try {
+    const fromDb = await db.guest_sessions.where('event_slug').equals(slug).last();
+    if (fromDb && fromDb.name && fromDb.token) return fromDb;
+  } catch (_) {}
+  return null;
+}
+
+/**
+ * Clear local guest session on explicit logout/leave
+ */
+export async function clearLocalGuestSession(slug) {
+  if (!slug) return;
+  localStorage.removeItem(`guest_session_${slug}`);
+  try {
+    await db.guest_sessions.where('event_slug').equals(slug).delete();
+  } catch (_) {}
+}
+
