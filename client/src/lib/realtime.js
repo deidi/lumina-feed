@@ -51,22 +51,38 @@ export function initRealtimeHub(slug, options = {}) {
     }
   }
 
-  // Connect to lightweight enterprise WebSocket broker (EMQX)
+  // Connect to lightweight enterprise WebSocket broker (EMQX) with auto Cloud-Sync fallback
   const brokerUrl = 'wss://broker.emqx.io:8084/mqtt';
   onStatusChange('connecting');
+
+  let reconnectCount = 0;
+  const MAX_RECONNECT_ATTEMPTS = 3;
+  let isUsingCloudFallback = false;
+
+  // Safety fallback timer: if broker is unreachable after 4.5s, seamlessly transition to cloud sync
+  const connectionSafetyTimer = setTimeout(() => {
+    if (!isDestroyed && (!client || !client.connected)) {
+      isUsingCloudFallback = true;
+      onStatusChange('cloud_sync');
+      onPeerCountChange(1);
+    }
+  }, 4500);
 
   let client = null;
   try {
     client = mqtt.connect(brokerUrl, {
       clientId: `luminafeed_${isHost ? 'host' : 'guest'}_${myClientId}`,
       clean: true,
-      connectTimeout: 8000,
-      reconnectPeriod: 2500,
+      connectTimeout: 6000,
+      reconnectPeriod: 3000,
       keepalive: 45,
     });
 
     client.on('connect', () => {
       if (isDestroyed) return;
+      clearTimeout(connectionSafetyTimer);
+      reconnectCount = 0;
+      isUsingCloudFallback = false;
       onStatusChange('connected');
       onPeerCountChange(1);
 
@@ -143,18 +159,38 @@ export function initRealtimeHub(slug, options = {}) {
     });
 
     client.on('offline', () => {
-      if (!isDestroyed) onStatusChange('reconnecting');
+      if (isDestroyed) return;
+      if (reconnectCount >= MAX_RECONNECT_ATTEMPTS || isUsingCloudFallback) {
+        onStatusChange('cloud_sync');
+      } else {
+        onStatusChange('reconnecting');
+      }
     });
 
     client.on('reconnect', () => {
-      if (!isDestroyed) onStatusChange('reconnecting');
+      if (isDestroyed) return;
+      reconnectCount++;
+      if (reconnectCount > MAX_RECONNECT_ATTEMPTS) {
+        isUsingCloudFallback = true;
+        onStatusChange('cloud_sync');
+        try {
+          client.end(true);
+        } catch (_) {}
+      } else {
+        onStatusChange('reconnecting');
+      }
     });
 
     client.on('error', (err) => {
       console.warn('Realtime broker warning:', err.message);
+      if (reconnectCount >= MAX_RECONNECT_ATTEMPTS) {
+        isUsingCloudFallback = true;
+        onStatusChange('cloud_sync');
+      }
     });
   } catch (err) {
     console.error('Failed to initialize realtime connection:', err);
+    onStatusChange('cloud_sync');
   }
 
   function requestGallerySync() {
