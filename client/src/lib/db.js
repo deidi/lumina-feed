@@ -447,35 +447,43 @@ export async function getEvents(hostName = '') {
 export async function validateAndFetchEvent(slug) {
   if (!slug) throw new Error('Event slug is required');
   const cleanSlug = String(slug).trim().toLowerCase();
+  const rawSlug = String(slug).trim();
 
   if (isStorageConfigured()) {
     const client = getSupabaseClient();
     
-    // 1. Query Supabase PostgreSQL `events` table
+    // 1. Query Supabase PostgreSQL `events` table (authoritative source of truth)
     let dbEvent = null;
     try {
-      const { data } = await client
+      const { data, error } = await client
         .from('events')
         .select('*')
-        .eq('slug', cleanSlug)
+        .or(`slug.eq.${cleanSlug},slug.ilike.${cleanSlug}`)
         .maybeSingle();
-      dbEvent = data;
+      if (!error && data) dbEvent = data;
     } catch (_) {}
 
-    // 2. Fetch storage manifest `_events/${slug}.json` for cross-device encryption key & frame sync
+    // 2. If event does not exist in Supabase DB (or was deleted by host)
+    if (!dbEvent || dbEvent.status === 'deleted') {
+      if (typeof localStorage !== 'undefined') {
+        localStorage.removeItem(`luminafeed_guest_${cleanSlug}`);
+        localStorage.removeItem(`caps_guest_${cleanSlug}`);
+        localStorage.removeItem(`luminafeed_guest_name_${cleanSlug}`);
+        localStorage.removeItem(`luminafeed_key_${cleanSlug}`);
+      }
+      // Opportunistically purge any orphaned storage manifests or files that remained
+      deleteEventFilesFromStorage(cleanSlug).catch(() => {});
+      if (rawSlug !== cleanSlug) {
+        deleteEventFilesFromStorage(rawSlug).catch(() => {});
+      }
+      throw new Error('Event not found. This event may have ended or was deleted by the host.');
+    }
+
+    // 3. Fetch storage manifest `_events/${slug}.json` only for cross-device encryption key & frame sync
     let manifest = null;
     try {
       manifest = await getEventManifestFromStorage(cleanSlug);
     } catch (_) {}
-
-    if (!dbEvent && !manifest) {
-      // Event does not exist on Supabase Cloud (or was deleted by host)
-      if (typeof localStorage !== 'undefined') {
-        localStorage.removeItem(`luminafeed_guest_${cleanSlug}`);
-        localStorage.removeItem(`caps_guest_${cleanSlug}`);
-      }
-      throw new Error('Event not found. This event may have ended or was deleted by the host.');
-    }
 
     const storedKey = (
       getStoredEventKey(cleanSlug) ||
@@ -488,39 +496,16 @@ export async function validateAndFetchEvent(slug) {
       setStoredEventKey(cleanSlug, storedKey);
     }
 
-    if (dbEvent) {
-      return {
-        ...dbEvent,
-        status: dbEvent.status || 'active',
-        max_photos: Number(dbEvent.max_photos) || 100,
-        guest_upload_limit: Number(dbEvent.guest_upload_limit) || 20,
-        is_encrypted: Boolean(dbEvent.is_encrypted || dbEvent.e2ee_enabled || storedKey),
-        e2ee_enabled: Boolean(dbEvent.e2ee_enabled || dbEvent.is_encrypted || storedKey),
-        encryption_key: storedKey,
-        frame_url: dbEvent.frame_url || manifest?.frame_url || null,
-        frame_config: dbEvent.frame_config || manifest?.frame_config || { enabled: false, preset: 'none', text: '' }
-      };
-    }
-
     return {
-      slug: manifest.slug || cleanSlug,
-      name: manifest.name || cleanSlug,
-      host_name: manifest.host_name || 'Host',
-      date: manifest.date || new Date().toISOString().split('T')[0],
-      tagline: manifest.tagline || 'Memories Shared in Real-Time',
-      moderation_enabled: manifest.moderation_enabled !== false,
-      auto_approve: Boolean(manifest.auto_approve),
-      e2ee_enabled: Boolean(manifest.is_encrypted || manifest.e2ee_enabled || storedKey),
-      allow_guest_downloads: manifest.allow_guest_downloads !== false,
-      frame_url: manifest.frame_url || null,
-      frame_config: manifest.frame_config || { enabled: false, preset: 'none', text: '' },
-      guest_upload_limit: Number(manifest.guest_upload_limit) || 20,
-      max_photos: Number(manifest.max_photos) || 100,
-      exif_strip: manifest.exif_strip !== false,
-      is_encrypted: Boolean(manifest.is_encrypted || manifest.e2ee_enabled || storedKey),
+      ...dbEvent,
+      status: dbEvent.status || 'active',
+      max_photos: Number(dbEvent.max_photos) || 100,
+      guest_upload_limit: Number(dbEvent.guest_upload_limit) || 20,
+      is_encrypted: Boolean(dbEvent.is_encrypted || dbEvent.e2ee_enabled || storedKey),
+      e2ee_enabled: Boolean(dbEvent.e2ee_enabled || dbEvent.is_encrypted || storedKey),
       encryption_key: storedKey,
-      status: manifest.status || 'active',
-      created_at: manifest.created_at || new Date().toISOString()
+      frame_url: dbEvent.frame_url || manifest?.frame_url || null,
+      frame_config: dbEvent.frame_config || manifest?.frame_config || { enabled: false, preset: 'none', text: '' }
     };
   }
 
@@ -707,7 +692,8 @@ export async function updateEventStatus(slug, status) {
  * Delete an event, cascading across Supabase Storage and PostgreSQL tables
  */
 export async function deleteEvent(slug) {
-  const cleanSlug = String(slug).trim();
+  const cleanSlug = String(slug).trim().toLowerCase();
+  const rawSlug = String(slug).trim();
   let supabaseDeleted = 0;
 
   if (isStorageConfigured()) {
@@ -715,17 +701,31 @@ export async function deleteEvent(slug) {
     try {
       const storageResult = await deleteEventFilesFromStorage(cleanSlug);
       supabaseDeleted = storageResult?.deletedCount || 0;
+      if (rawSlug !== cleanSlug) {
+        await deleteEventFilesFromStorage(rawSlug);
+      }
     } catch (storageErr) {
       console.warn('Error deleting event files from Supabase Storage:', storageErr);
     }
 
     // 2. Cascade delete database records
     await deleteCloudEvent(cleanSlug).catch(() => {});
+    if (rawSlug !== cleanSlug) {
+      await deleteCloudEvent(rawSlug).catch(() => {});
+    }
   }
 
   if (typeof localStorage !== 'undefined') {
     localStorage.removeItem(`luminafeed_guest_${cleanSlug}`);
     localStorage.removeItem(`caps_guest_${cleanSlug}`);
+    localStorage.removeItem(`luminafeed_guest_name_${cleanSlug}`);
+    localStorage.removeItem(`luminafeed_key_${cleanSlug}`);
+    if (rawSlug !== cleanSlug) {
+      localStorage.removeItem(`luminafeed_guest_${rawSlug}`);
+      localStorage.removeItem(`caps_guest_${rawSlug}`);
+      localStorage.removeItem(`luminafeed_guest_name_${rawSlug}`);
+      localStorage.removeItem(`luminafeed_key_${rawSlug}`);
+    }
   }
 
   return { success: true, supabaseDeleted };

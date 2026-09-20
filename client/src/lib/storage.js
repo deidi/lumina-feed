@@ -770,36 +770,48 @@ export async function deleteEventFilesFromStorage(eventSlug) {
   try {
     const client = getSupabaseClient();
     const { bucket } = getBaaSConfig();
-    const safeSlug = eventSlug.replace(/[^a-zA-Z0-9-_]/g, '_');
+    const cleanSlug = String(eventSlug || '').trim().toLowerCase();
+    const rawSlug = String(eventSlug || '').trim();
+    const safeCleanSlug = cleanSlug.replace(/[^a-zA-Z0-9-_]/g, '_');
+    const safeRawSlug = rawSlug.replace(/[^a-zA-Z0-9-_]/g, '_');
     const allPaths = new Set();
 
-    // 1. Collect all photo assets
-    try {
-      const { data: files } = await client.storage.from(bucket).list(safeSlug, { limit: 500 });
-      if (files && files.length > 0) {
-        files.forEach(f => {
-          if (f && f.name && !f.name.startsWith('.')) {
-            allPaths.add(`${safeSlug}/${f.name}`);
-          }
-        });
-      }
-    } catch (_) {}
+    // 1. Collect all photo assets from all potential folder casing variants
+    const foldersToCheck = Array.from(new Set([safeCleanSlug, safeRawSlug, cleanSlug, rawSlug]));
+    for (const folder of foldersToCheck) {
+      try {
+        const { data: files } = await client.storage.from(bucket).list(folder, { limit: 500 });
+        if (files && files.length > 0) {
+          files.forEach(f => {
+            if (f && f.name && !f.name.startsWith('.')) {
+              allPaths.add(`${folder}/${f.name}`);
+            }
+          });
+        }
+      } catch (_) {}
+    }
 
     // 2. Collect frame assets
-    try {
-      const { data: frameFiles } = await client.storage.from(bucket).list(`_frames/${safeSlug}`, { limit: 10 });
-      if (frameFiles && frameFiles.length > 0) {
-        frameFiles.forEach(f => {
-          if (f && f.name) allPaths.add(`_frames/${safeSlug}/${f.name}`);
-        });
-      }
-    } catch (_) {}
+    for (const folder of [`_frames/${safeCleanSlug}`, `_frames/${safeRawSlug}`]) {
+      try {
+        const { data: frameFiles } = await client.storage.from(bucket).list(folder, { limit: 10 });
+        if (frameFiles && frameFiles.length > 0) {
+          frameFiles.forEach(f => {
+            if (f && f.name) allPaths.add(`${folder}/${f.name}`);
+          });
+        }
+      } catch (_) {}
+    }
 
-    // 3. Manifests
-    allPaths.add(`_events/${safeSlug}.json`);
-    allPaths.add(`_events/${safeSlug}_approved.json`);
-    allPaths.add(`_events/${eventSlug}.json`);
-    allPaths.add(`_events/${eventSlug}_approved.json`);
+    // 3. Manifests (both lowercased and raw casing)
+    allPaths.add(`_events/${safeCleanSlug}.json`);
+    allPaths.add(`_events/${safeCleanSlug}_approved.json`);
+    allPaths.add(`_events/${safeRawSlug}.json`);
+    allPaths.add(`_events/${safeRawSlug}_approved.json`);
+    allPaths.add(`_events/${cleanSlug}.json`);
+    allPaths.add(`_events/${cleanSlug}_approved.json`);
+    allPaths.add(`_events/${rawSlug}.json`);
+    allPaths.add(`_events/${rawSlug}_approved.json`);
 
     const pathsToDelete = Array.from(allPaths);
     if (pathsToDelete.length > 0) {
@@ -1424,10 +1436,16 @@ export async function deleteCloudEvent(slug) {
   if (!slug || !isStorageConfigured()) return;
   try {
     const client = getSupabaseClient();
-    try { await client.from('photos').delete().eq('event_slug', slug); } catch (_) {}
-    try { await client.from('guests').delete().eq('event_slug', slug); } catch (_) {}
-    try { await client.from('events').delete().eq('slug', slug); } catch (_) {}
-    await deleteEventFilesFromStorage(slug);
+    const cleanSlug = String(slug).trim().toLowerCase();
+    const rawSlug = String(slug).trim();
+
+    try { await client.from('photos').delete().or(`event_slug.eq.${cleanSlug},event_slug.eq.${rawSlug}`); } catch (_) {}
+    try { await client.from('guests').delete().or(`event_slug.eq.${cleanSlug},event_slug.eq.${rawSlug}`); } catch (_) {}
+    try { await client.from('events').delete().or(`slug.eq.${cleanSlug},slug.eq.${rawSlug}`); } catch (_) {}
+    await deleteEventFilesFromStorage(cleanSlug);
+    if (rawSlug !== cleanSlug) {
+      await deleteEventFilesFromStorage(rawSlug);
+    }
   } catch (err) {
     console.warn('deleteCloudEvent db error:', err);
   }
@@ -1463,7 +1481,11 @@ export async function syncGuestToCloud(eventSlug, guestData) {
  * Database Layer: Reconnect returning guest or register new guest with 4-digit passcode protection (Option B)
  */
 export async function registerOrVerifyGuestInCloud(eventSlug, guestName, pinHash = null) {
-  if (!eventSlug || !guestName || !isStorageConfigured()) {
+  if (!eventSlug || !guestName) {
+    return { success: false, error: 'Event slug and guest name are required' };
+  }
+
+  if (!isStorageConfigured()) {
     const fallbackToken = generateSecureToken('guest');
     return {
       success: true,
@@ -1475,8 +1497,22 @@ export async function registerOrVerifyGuestInCloud(eventSlug, guestName, pinHash
 
   try {
     const client = getSupabaseClient();
-    const cleanSlug = eventSlug.trim();
+    const cleanSlug = String(eventSlug || '').trim().toLowerCase();
     const cleanName = guestName.trim();
+
+    // Verify event exists and is not deleted in Supabase events table
+    const { data: eventRow, error: evErr } = await client
+      .from('events')
+      .select('slug, status')
+      .or(`slug.eq.${cleanSlug},slug.ilike.${cleanSlug}`)
+      .maybeSingle();
+
+    if (evErr || !eventRow || eventRow.status === 'deleted') {
+      return {
+        success: false,
+        error: 'Event not found. This event may have ended or was deleted by the host.'
+      };
+    }
 
     // Query for existing guest in this event with matching name
     const { data: existing, error: fetchErr } = await client
@@ -1548,12 +1584,9 @@ export async function registerOrVerifyGuestInCloud(eventSlug, guestName, pinHash
     };
   } catch (err) {
     console.warn('registerOrVerifyGuestInCloud error:', err);
-    const fallbackToken = generateSecureToken('guest');
     return {
-      success: true,
-      guest: { event_slug: eventSlug, name: guestName, token: fallbackToken, upload_count: 0 },
-      token: fallbackToken,
-      isReturning: false
+      success: false,
+      error: err.message || 'Failed to connect to event space'
     };
   }
 }

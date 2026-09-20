@@ -872,10 +872,15 @@
         }
       }
     } else if (msg.type === "event:deleted") {
-      if (
-        (guestEventData && guestEventData.slug === msg.payload.slug) ||
-        (selectedEvent && selectedEvent.slug === msg.payload.slug)
-      ) {
+      const deletedSlug = String(msg.payload?.slug || "").trim().toLowerCase();
+      const currentSlug = String(currentEventSlug || guestEventData?.slug || selectedEvent?.slug || "").trim().toLowerCase();
+      if (deletedSlug && (currentSlug === deletedSlug || guestEventData?.slug?.toLowerCase() === deletedSlug)) {
+        stopGuestAutoSync();
+        guestEventData = null;
+        guestSession = null;
+        myUploads = [];
+        liveGalleryPhotos = [];
+        errorMsg = "This event has been deleted by the host.";
         alert("This event has been deleted by the host.");
         navigate("/");
       }
@@ -1720,6 +1725,25 @@
         await db.photos.where("event_slug").equals(deletedEventSlug).delete();
         await db.guests.where("event_slug").equals(deletedEventSlug).delete();
         await db.sync_logs.where("event_slug").equals(deletedEventSlug).delete();
+      } catch (_) {}
+
+      // 5. Broadcast real-time deletion notice to connected guests & slideshows
+      try {
+        if (wsHandle) {
+          wsHandle.send({
+            type: "event:deleted",
+            payload: { slug: deletedEventSlug }
+          });
+        }
+      } catch (_) {}
+
+      // 6. Purge local guest and encryption keys for this event
+      try {
+        const cleanSlug = deletedEventSlug.trim().toLowerCase();
+        localStorage.removeItem(`luminafeed_guest_${cleanSlug}`);
+        localStorage.removeItem(`caps_guest_${cleanSlug}`);
+        localStorage.removeItem(`luminafeed_guest_name_${cleanSlug}`);
+        localStorage.removeItem(`luminafeed_key_${cleanSlug}`);
       } catch (_) {}
 
       isDeleteModalOpen = false;
