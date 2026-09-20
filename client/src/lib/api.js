@@ -100,18 +100,8 @@ export const api = {
   deletePhoto: (slug, photoId, guestToken) => dbMethods.deletePhoto(slug, photoId, guestToken),
 
   // Moderation (Host Only - enhanced in Slice 4)
-  patchPhotoStatus: async (slug, photoId, status) => {
-    await dbMethods.db.photos.update(parseInt(photoId, 10), { status });
-    return { success: true, status };
-  },
-  bulkPatchPhotoStatus: async (slug, ids, status) => {
-    await dbMethods.db.transaction('rw', dbMethods.db.photos, async () => {
-      for (const id of ids) {
-        await dbMethods.db.photos.update(parseInt(id, 10), { status });
-      }
-    });
-    return { success: true, updated_count: ids.length };
-  },
+  patchPhotoStatus: (slug, photoId, status) => dbMethods.patchPhotoStatus(slug, photoId, status),
+  bulkPatchPhotoStatus: (slug, ids, status) => dbMethods.bulkPatchPhotoStatus(slug, ids, status),
 
   // Slideshow
   getSlideshowConfig: async (slug, options = {}) => {

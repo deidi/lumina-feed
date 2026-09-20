@@ -112,10 +112,10 @@ export async function exportSelectedPhotosZip(slug, photoIds, onProgress = () =>
     throw new Error('No photos selected for download');
   }
 
-  const idSet = new Set(photoIds.map(id => parseInt(id, 10)));
+  const idSet = new Set(photoIds.map(id => String(id)));
   const event = await db.events.where('slug').equals(slug).first();
   const allPhotos = await db.photos.where('event_slug').equals(slug).toArray();
-  const selectedPhotos = allPhotos.filter(p => idSet.has(p.id));
+  const selectedPhotos = allPhotos.filter(p => idSet.has(String(p.id)));
 
   const zip = new JSZip();
 

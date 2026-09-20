@@ -1058,8 +1058,8 @@
         if (removeFilename && targetSlug) {
           db.photos.where({ event_slug: targetSlug, filename: removeFilename }).delete().catch(() => {});
         }
-        if (removeId && !isNaN(parseInt(removeId, 10))) {
-          db.photos.delete(parseInt(removeId, 10)).catch(() => {});
+        if (removeId) {
+          db.photos.delete(removeId).catch(() => {});
         }
 
         // 3. Decrement guest upload count in Host DB if guest_token is present
