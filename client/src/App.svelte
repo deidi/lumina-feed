@@ -295,7 +295,14 @@
     const slug = photo.event_slug || currentEventSlug || selectedEvent?.slug || guestEventData?.slug || "";
     if (slug) {
       const cleanSlug = String(slug).trim().toLowerCase();
-      if (crypto.getStoredEventKey(cleanSlug) || guestEventData?.is_encrypted || guestEventData?.e2ee_enabled || selectedEvent?.is_encrypted || selectedEvent?.e2ee_enabled) {
+      // Only use event-level encryption flags as signal; a stored key alone is not enough
+      // (unencrypted photos in an E2EE-capable event still have plain CDN URLs)
+      if (guestEventData?.is_encrypted || guestEventData?.e2ee_enabled || selectedEvent?.is_encrypted || selectedEvent?.e2ee_enabled) {
+        return true;
+      }
+      // Stored key is only a strong signal if the photo has no plain CDN URL (i.e. it must be encrypted)
+      const rawUrl = photo.storage_orig_url || photo.storage_thumb_url || photo.original_url || photo.thumb_url || "";
+      if (!rawUrl && crypto.getStoredEventKey(cleanSlug)) {
         return true;
       }
     }
@@ -414,6 +421,20 @@
     const isEnc = isPhotoEncrypted(photo);
     const key = resolveEventDecryptionKey(photo);
 
+    // Raw CDN URLs (non-encrypted): check and return immediately
+    const rawOrigUrl = photo.storage_orig_url || photo.original_url || photo.original_path || "";
+    const rawThumbUrl = photo.storage_thumb_url || photo.thumb_url || photo.thumbnail_path || "";
+
+    if (rawOrigUrl && (rawOrigUrl.includes(".lenc") || rawOrigUrl.includes(".enc"))) {
+      // Encrypted path — fall through to decryption
+    } else if (rawThumbUrl && (rawThumbUrl.includes(".lenc") || rawThumbUrl.includes(".enc"))) {
+      // Encrypted path — fall through to decryption
+    } else if (!isEnc && (rawOrigUrl || rawThumbUrl)) {
+      // Non-encrypted photo with valid CDN URL — serve directly
+      if (isThumb) return rawThumbUrl || rawOrigUrl || "";
+      return rawOrigUrl || rawThumbUrl || "";
+    }
+
     if (isEnc || key) {
       if (key) {
         if (!photo.decrypted_thumb_url && !photo.thumb_blob && !photo._isDecryptingThumb) {
@@ -451,20 +472,15 @@
       const validThumb = photo.decrypted_thumb_url && !photo.decrypted_thumb_url.includes(".lenc") && !photo.decrypted_thumb_url.includes(".enc")
         ? photo.decrypted_thumb_url
         : (photo.thumb_blob ? db.getCachedObjectURL(photo.thumb_blob, `thumb_${photo.id || photo.filename}`) : "");
-      
+
       if (validThumb) return validThumb;
-      return "";
+
+      // While decryption is pending for encrypted photos, show raw CDN URL as fallback if available
+      if (isThumb) return rawThumbUrl || rawOrigUrl || "";
+      return rawOrigUrl || rawThumbUrl || "";
     }
 
-    const rawOrigUrl = photo.storage_orig_url || photo.original_url || photo.original_path || "";
-    const rawThumbUrl = photo.storage_thumb_url || photo.thumb_url || photo.thumbnail_path || "";
-
-    if (rawOrigUrl && (rawOrigUrl.includes(".lenc") || rawOrigUrl.includes(".enc"))) return "";
-    if (rawThumbUrl && (rawThumbUrl.includes(".lenc") || rawThumbUrl.includes(".enc"))) return "";
-
-    if (isThumb) {
-      return rawThumbUrl || rawOrigUrl || "";
-    }
+    if (isThumb) return rawThumbUrl || rawOrigUrl || "";
     return rawOrigUrl || rawThumbUrl || "";
   }
 

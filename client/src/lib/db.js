@@ -1139,8 +1139,9 @@ export async function ensurePhotoDecrypted(photo, key = '') {
     (rawPath && (rawPath.includes('.enc') || rawPath.includes('.lenc'))) ||
     (directUrl && (directUrl.includes('.enc') || directUrl.includes('.lenc'))) ||
     photo.is_encrypted ||
-    photo.encrypted ||
-    eventKey
+    photo.encrypted
+    // Note: eventKey alone is NOT sufficient to determine a photo is encrypted.
+    // Only use path/URL signatures and explicit flags.
   );
   if (!isEnc) return photo;
   if (photo.decrypted_thumb_url && !photo.decrypted_thumb_url.includes('.lenc') && !photo.decrypted_thumb_url.includes('.enc')) return photo;
@@ -1248,8 +1249,8 @@ export async function getDecryptedOriginalBlob(photo, key = '') {
       (targetPath && (targetPath.includes('.enc') || targetPath.includes('.lenc'))) ||
       (directUrl && (directUrl.includes('.enc') || directUrl.includes('.lenc'))) ||
       photo.is_encrypted ||
-      photo.encrypted ||
-      eventKey
+      photo.encrypted
+      // Note: eventKey alone is NOT sufficient to determine a photo is encrypted.
     );
 
     if (isEnc && eventKey) {
