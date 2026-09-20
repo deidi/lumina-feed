@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>LuminaFeed — Memories Shared</title>
+    <script>
+      // GitHub Pages SPA Single Page Application redirect script
+      // When a user visits https://<user>.github.io/<repo>/event/<slug>, GitHub Pages serves 404.html
+      // This script redirects it to https://<user>.github.io/<repo>/#/event/<slug>
+      // Also handles custom root domains (e.g. luminafeed.app/event/<slug>) cleanly
+      var l = window.location;
+      var pathSegments = l.pathname.split('/').filter(Boolean);
+      
+      // If the first segment matches the GitHub repository name, keep it as the repo base
+      var firstSeg = pathSegments.length > 0 ? pathSegments[0].toLowerCase() : '';
+      var isProjectRepo = firstSeg === 'lumina-feed' || firstSeg === 'luminafeed';
+      var repoPrefix = isProjectRepo ? '/' + pathSegments[0] : '';
+      var routeParts = isProjectRepo ? pathSegments.slice(1) : pathSegments;
+      var routePath = routeParts.length > 0 ? '/' + routeParts.join('/') : '/';
+
+      var newUrl = l.protocol + '//' + l.hostname + (l.port ? ':' + l.port : '') +
+        repoPrefix + '/#' + (routePath === '/' ? '' : routePath) +
+        l.search + l.hash;
+
+      window.location.replace(newUrl);
+    </script>
+  </head>
+  <body>
+    <div>
+      <div class="spinner"></div>
+      <h2>Loading LuminaFeed Event...</h2>
+      <p style="color: #94A3B8;">Redirecting to your event space</p>
+    </div>
+  </body>
+</html>
