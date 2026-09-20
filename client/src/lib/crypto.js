@@ -206,20 +206,24 @@ export async function decryptBlob(blobOrBuffer, keyString, mimeType = 'image/jpe
  */
 export function getStoredEventKey(slug) {
   if (!slug || typeof localStorage === 'undefined') return '';
+  const cleanSlug = String(slug).trim().toLowerCase();
   return (
+    localStorage.getItem(`luminafeed_key_${cleanSlug}`) ||
+    sessionStorage.getItem(`luminafeed_key_${cleanSlug}`) ||
     localStorage.getItem(`luminafeed_key_${slug}`) ||
-    sessionStorage.getItem(`luminafeed_key_${slug}`) ||
     ''
   ).trim();
 }
 
 export function setStoredEventKey(slug, key) {
   if (!slug || typeof localStorage === 'undefined') return;
+  const cleanSlug = String(slug).trim().toLowerCase();
   if (key) {
-    localStorage.setItem(`luminafeed_key_${slug}`, key.trim());
+    localStorage.setItem(`luminafeed_key_${cleanSlug}`, key.trim());
   } else {
+    localStorage.removeItem(`luminafeed_key_${cleanSlug}`);
+    sessionStorage.removeItem(`luminafeed_key_${cleanSlug}`);
     localStorage.removeItem(`luminafeed_key_${slug}`);
-    sessionStorage.removeItem(`luminafeed_key_${slug}`);
   }
 }
 

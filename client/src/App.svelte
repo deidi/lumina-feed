@@ -487,7 +487,7 @@
     const searchParams = new URLSearchParams(
       typeof window !== "undefined" ? window.location.search : ""
     );
-    const keyParam = hashParams.get("k") || searchParams.get("k");
+    const keyParam = hashParams.get("k") || hashParams.get("key") || searchParams.get("k") || searchParams.get("key");
 
     // Clean any trailing slashes except for root
     if (path.length > 1 && path.endsWith("/")) {

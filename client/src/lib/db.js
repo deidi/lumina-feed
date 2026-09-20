@@ -445,40 +445,29 @@ export async function getEvents(hostName = '') {
  */
 export async function validateAndFetchEvent(slug) {
   if (!slug) throw new Error('Event slug is required');
-  const cleanSlug = String(slug).trim();
+  const cleanSlug = String(slug).trim().toLowerCase();
 
   if (isStorageConfigured()) {
     const client = getSupabaseClient();
     
     // 1. Query Supabase PostgreSQL `events` table
-    const { data: dbEvent, error: dbErr } = await client
-      .from('events')
-      .select('*')
-      .eq('slug', cleanSlug)
-      .maybeSingle();
+    let dbEvent = null;
+    try {
+      const { data } = await client
+        .from('events')
+        .select('*')
+        .eq('slug', cleanSlug)
+        .maybeSingle();
+      dbEvent = data;
+    } catch (_) {}
 
-    if (dbEvent) {
-      const storedKey = getStoredEventKey(cleanSlug) || dbEvent.encryption_key || '';
-      if (storedKey) {
-        setStoredEventKey(cleanSlug, storedKey);
-      }
-      return {
-        ...dbEvent,
-        status: dbEvent.status || 'active',
-        max_photos: Number(dbEvent.max_photos) || 100,
-        guest_upload_limit: Number(dbEvent.guest_upload_limit) || 20,
-        is_encrypted: Boolean(dbEvent.is_encrypted || dbEvent.e2ee_enabled || storedKey),
-        encryption_key: storedKey
-      };
-    }
-
-    // 2. Fallback: check storage manifest `_events/${slug}.json`
+    // 2. Fetch storage manifest `_events/${slug}.json` for cross-device encryption key & frame sync
     let manifest = null;
     try {
       manifest = await getEventManifestFromStorage(cleanSlug);
     } catch (_) {}
 
-    if (!manifest) {
+    if (!dbEvent && !manifest) {
       // Event does not exist on Supabase Cloud (or was deleted by host)
       if (typeof localStorage !== 'undefined') {
         localStorage.removeItem(`luminafeed_guest_${cleanSlug}`);
@@ -487,7 +476,31 @@ export async function validateAndFetchEvent(slug) {
       throw new Error('Event not found. This event may have ended or was deleted by the host.');
     }
 
-    const storedKey = getStoredEventKey(cleanSlug) || manifest.encryption_key || '';
+    const storedKey = (
+      getStoredEventKey(cleanSlug) ||
+      manifest?.encryption_key ||
+      dbEvent?.encryption_key ||
+      ''
+    ).trim();
+
+    if (storedKey) {
+      setStoredEventKey(cleanSlug, storedKey);
+    }
+
+    if (dbEvent) {
+      return {
+        ...dbEvent,
+        status: dbEvent.status || 'active',
+        max_photos: Number(dbEvent.max_photos) || 100,
+        guest_upload_limit: Number(dbEvent.guest_upload_limit) || 20,
+        is_encrypted: Boolean(dbEvent.is_encrypted || dbEvent.e2ee_enabled || storedKey),
+        e2ee_enabled: Boolean(dbEvent.e2ee_enabled || dbEvent.is_encrypted || storedKey),
+        encryption_key: storedKey,
+        frame_url: dbEvent.frame_url || manifest?.frame_url || null,
+        frame_config: dbEvent.frame_config || manifest?.frame_config || { enabled: false, preset: 'none', text: '' }
+      };
+    }
+
     return {
       slug: manifest.slug || cleanSlug,
       name: manifest.name || cleanSlug,
@@ -496,14 +509,14 @@ export async function validateAndFetchEvent(slug) {
       tagline: manifest.tagline || 'Memories Shared in Real-Time',
       moderation_enabled: manifest.moderation_enabled !== false,
       auto_approve: Boolean(manifest.auto_approve),
-      e2ee_enabled: Boolean(manifest.is_encrypted || manifest.e2ee_enabled),
+      e2ee_enabled: Boolean(manifest.is_encrypted || manifest.e2ee_enabled || storedKey),
       allow_guest_downloads: manifest.allow_guest_downloads !== false,
       frame_url: manifest.frame_url || null,
       frame_config: manifest.frame_config || { enabled: false, preset: 'none', text: '' },
       guest_upload_limit: Number(manifest.guest_upload_limit) || 20,
       max_photos: Number(manifest.max_photos) || 100,
       exif_strip: manifest.exif_strip !== false,
-      is_encrypted: Boolean(manifest.is_encrypted || storedKey),
+      is_encrypted: Boolean(manifest.is_encrypted || manifest.e2ee_enabled || storedKey),
       encryption_key: storedKey,
       status: manifest.status || 'active',
       created_at: manifest.created_at || new Date().toISOString()

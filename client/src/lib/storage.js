@@ -861,9 +861,11 @@ export async function syncEventManifestToStorage(eventData, hostName = 'Host') {
   try {
     const client = getSupabaseClient();
     const { bucket } = getBaaSConfig();
-    const safeSlug = eventData.slug.replace(/[^a-zA-Z0-9-_]/g, '_');
+    const cleanSlug = String(eventData.slug).trim().toLowerCase();
+    const safeSlug = cleanSlug.replace(/[^a-zA-Z0-9-_]/g, '_');
+    const key = (eventData.encryption_key || getStoredEventKey(cleanSlug) || '').trim();
     const manifest = {
-      slug: eventData.slug,
+      slug: cleanSlug,
       name: eventData.name,
       date: eventData.date || new Date().toISOString().split('T')[0],
       tagline: eventData.tagline || '',
@@ -871,11 +873,12 @@ export async function syncEventManifestToStorage(eventData, hostName = 'Host') {
       guest_upload_limit: Number(eventData.guest_upload_limit) || GUEST_MAX_PHOTOS_LIMIT,
       moderation_enabled: eventData.moderation_enabled !== false,
       auto_approve: Boolean(eventData.auto_approve),
-      e2ee_enabled: Boolean(eventData.e2ee_enabled),
+      e2ee_enabled: Boolean(eventData.e2ee_enabled || eventData.is_encrypted || key),
       allow_guest_downloads: eventData.allow_guest_downloads !== false,
       frame_url: eventData.frame_url || null,
       frame_config: eventData.frame_config || { enabled: false, preset: 'none' },
-      is_encrypted: Boolean(eventData.is_encrypted || eventData.e2ee_enabled),
+      is_encrypted: Boolean(eventData.is_encrypted || eventData.e2ee_enabled || key),
+      encryption_key: key,
       admin_wrapped_key: eventData.admin_wrapped_key || null,
       status: eventData.status || 'active',
       host_name: hostName || 'Host',
@@ -900,9 +903,24 @@ export async function getEventManifestFromStorage(eventSlug) {
   try {
     const client = getSupabaseClient();
     const { bucket } = getBaaSConfig();
-    const safeSlug = eventSlug.replace(/[^a-zA-Z0-9-_]/g, '_');
-    const { data: blob, error } = await client.storage.from(bucket).download(`_events/${safeSlug}.json`);
-    if (error || !blob) return null;
+    const cleanSlug = String(eventSlug).trim().toLowerCase();
+    const safeSlug = cleanSlug.replace(/[^a-zA-Z0-9-_]/g, '_');
+    const path = `_events/${safeSlug}.json`;
+    let blob = null;
+    try {
+      const { data, error } = await client.storage.from(bucket).download(path);
+      if (data && !error) blob = data;
+    } catch (_) {}
+
+    if (!blob) {
+      try {
+        const publicUrl = client.storage.from(bucket).getPublicUrl(path).data.publicUrl;
+        const res = await fetch(publicUrl);
+        if (res.ok) blob = await res.blob();
+      } catch (_) {}
+    }
+
+    if (!blob) return null;
     const text = await blob.text();
     return JSON.parse(text);
   } catch (err) {
