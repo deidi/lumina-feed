@@ -1,0 +1,29 @@
+node_modules/
+dist/
+client/dist/
+.DS_Store
+Thumbs.db
+*.log
+
+# Local environment & secrets
+client/.env
+client/.env.local
+super-admin/.env
+*.local
+*.local.json
+*.local.md
+
+# Super Admin Local Console (Never commit to Git)
+super-admin/
+*super-admin*
+*super_admin*
+run-super-admin*
+super_admin_report*
+
+# AI & Agent Guidelines (Local Only - Never commit to Git)
+AGENTS.md
+.agents/
+
+# Backups and local archives
+archive/
+

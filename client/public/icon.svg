@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#2563eb" />
+      <stop offset="100%" stop-color="#1d4ed8" />
+    </linearGradient>
+  </defs>
+  <!-- Background Squircle -->
+  <rect width="512" height="512" rx="128" fill="url(#grad)" />
+  
+  <!-- Concept 04: The Unified Silhouette (Camera + Instant Photo) -->
+  <!-- Unified Outer Silhouette -->
+  <path d="M 206 100 C 206 94 212 90 220 90 L 292 90 C 300 90 306 94 306 100 L 306 120 L 366 120 C 394 120 416 142 416 170 L 416 382 C 416 410 394 432 366 432 L 146 432 C 118 432 96 410 96 382 L 96 170 C 96 142 118 120 146 120 L 206 120 Z" fill="none" stroke="#ffffff" stroke-width="24" stroke-linejoin="round" />
+
+  <!-- Photo Chin Divider Line (Classic Instant Film Lip) -->
+  <line x1="126" y1="362" x2="386" y2="362" stroke="#ffffff" stroke-opacity="0.85" stroke-width="18" stroke-linecap="round" />
+
+  <!-- Centered Lens Core -->
+  <circle cx="256" cy="242" r="64" fill="none" stroke="#ffffff" stroke-width="22" />
+  <circle cx="256" cy="242" r="26" fill="#ffffff" />
+  <!-- Minimal Lens Glint -->
+  <circle cx="267" cy="231" r="7" fill="#2563eb" />
+  
+  <!-- Minimalist Flash Notch -->
+  <rect x="350" y="152" width="28" height="18" rx="6" fill="#ffffff" opacity="0.95" />
+</svg>

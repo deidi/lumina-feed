@@ -1,0 +1,5 @@
+User-agent: *
+Allow: /
+
+# Sitemap location for Googlebot and search engines
+Sitemap: https://deidi.github.io/lumina-feed/sitemap.xml
