@@ -6,6 +6,7 @@ import {
   getStoredEventKey,
   setStoredEventKey,
   decryptBlob,
+  isEncryptedBuffer,
   computeSha256,
   generateSecureToken,
 } from './crypto.js';
@@ -1135,20 +1136,8 @@ export async function ensurePhotoDecrypted(photo, key = '') {
   const eventKey = (key || getStoredEventKey(slug) || photo.encryption_key || '').trim();
   const directUrl = photo.storage_thumb_url || photo.thumb_url || photo.storage_orig_url || photo.original_url || '';
   const rawPath = photo.storage_thumb_path || photo.storage_orig_path || photo.filename || '';
-  const isEnc = Boolean(
-    (rawPath && (rawPath.includes('.enc') || rawPath.includes('.lenc'))) ||
-    (directUrl && (directUrl.includes('.enc') || directUrl.includes('.lenc'))) ||
-    photo.is_encrypted ||
-    photo.encrypted
-    // Note: eventKey alone is NOT sufficient to determine a photo is encrypted.
-    // Only use path/URL signatures and explicit flags.
-  );
-  if (!isEnc) return photo;
-  if (photo.decrypted_thumb_url && !photo.decrypted_thumb_url.includes('.lenc') && !photo.decrypted_thumb_url.includes('.enc')) return photo;
 
   try {
-    if (!eventKey) return photo;
-
     const client = getSupabaseClient();
     const { bucket } = getBaaSConfig();
     let targetThumbPath = extractStoragePath(rawPath || directUrl, bucket);
@@ -1184,9 +1173,20 @@ export async function ensurePhotoDecrypted(photo, key = '') {
     }
 
     if (blob) {
-      const decrypted = await decryptBlob(blob, eventKey);
-      photo.decrypted_thumb_url = getCachedObjectURL(decrypted, `thumb_${photo.id || photo.filename}`);
-      photo.thumb_blob = decrypted;
+      let isEnc = false;
+      try {
+        const slice = await blob.slice(0, 16).arrayBuffer();
+        isEnc = isEncryptedBuffer(slice);
+      } catch (_) {}
+
+      if (isEnc && eventKey) {
+        const decrypted = await decryptBlob(blob, eventKey);
+        photo.decrypted_thumb_url = getCachedObjectURL(decrypted, `thumb_${photo.id || photo.filename}`);
+        photo.thumb_blob = decrypted;
+      } else if (!isEnc) {
+        photo.decrypted_thumb_url = getCachedObjectURL(blob, `thumb_${photo.id || photo.filename}`);
+        photo.thumb_blob = blob;
+      }
     }
 
     return photo;
@@ -1243,26 +1243,104 @@ export async function getDecryptedOriginalBlob(photo, key = '') {
       } catch (_) {}
     }
 
+    // 4. Thumbnail fallback if original download failed
+    if (!blob) {
+      const thumbUrl = photo.storage_thumb_url || photo.thumb_url || '';
+      const rawThumbPath = photo.storage_thumb_path || '';
+      let targetThumb = extractStoragePath(rawThumbPath || thumbUrl, bucket);
+      if (targetThumb && !targetThumb.includes('/') && slug) {
+        targetThumb = `${slug}/${targetThumb}`;
+      }
+      if (thumbUrl && thumbUrl.startsWith('http')) {
+        try {
+          const res = await fetch(thumbUrl);
+          if (res.ok) blob = await res.blob();
+        } catch (_) {}
+      }
+      if (!blob && targetThumb) {
+        try {
+          const { data, error } = await client.storage.from(bucket).download(targetThumb);
+          if (data && !error) blob = data;
+        } catch (_) {}
+      }
+    }
+
     if (!blob) return null;
 
-    const isEnc = Boolean(
+    let isEnc = Boolean(
       (targetPath && (targetPath.includes('.enc') || targetPath.includes('.lenc'))) ||
       (directUrl && (directUrl.includes('.enc') || directUrl.includes('.lenc'))) ||
       photo.is_encrypted ||
       photo.encrypted
-      // Note: eventKey alone is NOT sufficient to determine a photo is encrypted.
     );
 
-    if (isEnc && eventKey) {
-      const decrypted = await decryptBlob(blob, eventKey);
-      photo.original_blob = decrypted;
-      return decrypted;
+    // Verify magic bytes to distinguish real encrypted ciphertext from plain images
+    try {
+      const slice = await blob.slice(0, 16).arrayBuffer();
+      if (isEncryptedBuffer(slice)) {
+        isEnc = true;
+      } else {
+        isEnc = false;
+      }
+    } catch (_) {}
+
+    if (isEnc) {
+      if (eventKey) {
+        try {
+          const decrypted = await decryptBlob(blob, eventKey);
+          photo.original_blob = decrypted;
+          return decrypted;
+        } catch (decErr) {
+          console.warn('Decryption failed for photo blob:', decErr);
+          return null;
+        }
+      } else {
+        console.warn('Photo is encrypted, but no decryption key available');
+        return null;
+      }
     }
+
+    photo.original_blob = blob;
     return blob;
   } catch (err) {
     console.warn('getDecryptedOriginalBlob error:', err);
     return null;
   }
+}
+
+/**
+ * Download a photo to a local in-memory blob URL on the host machine.
+ * Handles both unencrypted and encrypted photos, falling back through
+ * direct fetch, Supabase Storage SDK download, and public URL.
+ */
+export async function downloadAndCachePhotoBlob(photo, key = '') {
+  if (!photo) return null;
+  if (photo.decrypted_orig_url && !photo.decrypted_orig_url.includes('.lenc') && !photo.decrypted_orig_url.includes('.enc')) {
+    return photo.decrypted_orig_url;
+  }
+  if (photo.original_blob) {
+    const url = getCachedObjectURL(photo.original_blob, `orig_${photo.id || photo.filename}`);
+    photo.decrypted_orig_url = url;
+    return url;
+  }
+
+  const blob = await getDecryptedOriginalBlob(photo, key);
+  if (blob) {
+    const url = getCachedObjectURL(blob, `orig_${photo.id || photo.filename}`);
+    photo.original_blob = blob;
+    photo.decrypted_orig_url = url;
+    photo._isDownloaded = true;
+    return url;
+  }
+
+  // Fallback to thumbnail blob if original is unreachable
+  if (photo.thumb_blob) {
+    const url = getCachedObjectURL(photo.thumb_blob, `thumb_${photo.id || photo.filename}`);
+    photo.decrypted_orig_url = url;
+    return url;
+  }
+
+  return null;
 }
 
 /**

@@ -376,6 +376,75 @@
     }
   }
 
+  async function prepareSlideshowPhoto(photo) {
+    if (!photo) return null;
+    if (photo.decrypted_orig_url && !photo.decrypted_orig_url.includes(".lenc") && !photo.decrypted_orig_url.includes(".enc")) {
+      return photo.decrypted_orig_url;
+    }
+    if (photo.original_blob) {
+      const url = db.getCachedObjectURL(photo.original_blob, `orig_${photo.id || photo.filename}`);
+      photo.decrypted_orig_url = url;
+      return url;
+    }
+    if (photo._isDownloading) return null;
+
+    photo._isDownloading = true;
+    const key = resolveEventDecryptionKey(photo);
+    try {
+      const url = await db.downloadAndCachePhotoBlob(photo, key);
+      photo._isDownloading = false;
+      if (url) {
+        photo.decrypted_orig_url = url;
+        triggerPhotosRefresh(photo);
+        return url;
+      }
+    } catch (err) {
+      console.warn("Failed to download photo to host temp file:", err);
+      photo._isDownloading = false;
+    }
+    return null;
+  }
+
+  async function prepareSlideshowPhotos(photos, priorityIndex = 0) {
+    if (!photos || photos.length === 0) return;
+
+    // 1. Immediately download & cache the priority slide (current slide)
+    if (photos[priorityIndex]) {
+      prepareSlideshowPhoto(photos[priorityIndex]);
+    }
+
+    // 2. Immediately download the next slide for seamless transition
+    const nextIdx = (priorityIndex + 1) % photos.length;
+    if (photos[nextIdx] && nextIdx !== priorityIndex) {
+      prepareSlideshowPhoto(photos[nextIdx]);
+    }
+
+    // 3. Concurrently pre-fetch remaining photos in the background into host temp cache
+    for (let i = 0; i < photos.length; i++) {
+      if (i === priorityIndex || i === nextIdx) continue;
+      const p = photos[i];
+      if (p && !p.decrypted_orig_url && !p.original_blob && !p._isDownloading) {
+        await new Promise((r) => setTimeout(r, 60));
+        prepareSlideshowPhoto(p);
+      }
+    }
+  }
+
+  function handleSlideshowImgError(e, slideIdx) {
+    const photo = slideshowPhotos[slideIdx];
+    if (!photo) return;
+    console.warn("Slideshow image failed to load, triggering temp download fallback:", photo);
+    if (photo.decrypted_thumb_url && photo.decrypted_thumb_url !== photo.decrypted_orig_url) {
+      photo.decrypted_orig_url = photo.decrypted_thumb_url;
+      if (e?.target) e.target.src = photo.decrypted_thumb_url;
+    } else if (photo.storage_thumb_url && !photo.storage_thumb_url.includes(".lenc") && !photo.storage_thumb_url.includes(".enc")) {
+      photo.decrypted_orig_url = photo.storage_thumb_url;
+      if (e?.target) e.target.src = photo.storage_thumb_url;
+    }
+    photo._isDownloading = false;
+    prepareSlideshowPhoto(photo);
+  }
+
   function getPhotoSrc(photo, isThumb = true) {
     if (!photo) return "";
     if (typeof photo === "string") {
@@ -418,21 +487,26 @@
       }
     }
 
+    // Trigger eager background download to host temp cache for full-res view or slideshow
+    if (!photo._isDownloading && !isThumb) {
+      prepareSlideshowPhoto(photo);
+    }
+
     const isEnc = isPhotoEncrypted(photo);
     const key = resolveEventDecryptionKey(photo);
 
-    // Raw CDN URLs (non-encrypted): check and return immediately
     const rawOrigUrl = photo.storage_orig_url || photo.original_url || photo.original_path || "";
     const rawThumbUrl = photo.storage_thumb_url || photo.thumb_url || photo.thumbnail_path || "";
 
+    // Never return raw encrypted ciphertext paths to <img> tags
     if (rawOrigUrl && (rawOrigUrl.includes(".lenc") || rawOrigUrl.includes(".enc"))) {
-      // Encrypted path — fall through to decryption
-    } else if (rawThumbUrl && (rawThumbUrl.includes(".lenc") || rawThumbUrl.includes(".enc"))) {
-      // Encrypted path — fall through to decryption
-    } else if (!isEnc && (rawOrigUrl || rawThumbUrl)) {
-      // Non-encrypted photo with valid CDN URL — serve directly
-      if (isThumb) return rawThumbUrl || rawOrigUrl || "";
-      return rawOrigUrl || rawThumbUrl || "";
+      if (photo.decrypted_thumb_url && !photo.decrypted_thumb_url.includes(".lenc") && !photo.decrypted_thumb_url.includes(".enc")) {
+        return photo.decrypted_thumb_url;
+      }
+      return "";
+    }
+    if (rawThumbUrl && (rawThumbUrl.includes(".lenc") || rawThumbUrl.includes(".enc"))) {
+      return "";
     }
 
     if (isEnc || key) {
@@ -451,22 +525,6 @@
             photo._isDecryptingThumb = false;
           });
         }
-
-        if (!isThumb && !photo.decrypted_orig_url && !photo.original_blob && !photo._isDecryptingOrig) {
-          photo._isDecryptingOrig = true;
-          db.getDecryptedOriginalBlob(photo, key).then((blob) => {
-            if (blob) {
-              const url = db.getCachedObjectURL(blob, `orig_${photo.id || photo.filename}`);
-              photo.decrypted_orig_url = url;
-              photo.original_blob = blob;
-              photo._isDecryptingOrig = false;
-              triggerPhotosRefresh(photo);
-            }
-          }).catch((e) => {
-            console.warn("getDecryptedOriginalBlob error in getPhotoSrc:", e);
-            photo._isDecryptingOrig = false;
-          });
-        }
       }
 
       const validThumb = photo.decrypted_thumb_url && !photo.decrypted_thumb_url.includes(".lenc") && !photo.decrypted_thumb_url.includes(".enc")
@@ -474,12 +532,10 @@
         : (photo.thumb_blob ? db.getCachedObjectURL(photo.thumb_blob, `thumb_${photo.id || photo.filename}`) : "");
 
       if (validThumb) return validThumb;
-
-      // While decryption is pending for encrypted photos, show raw CDN URL as fallback if available
-      if (isThumb) return rawThumbUrl || rawOrigUrl || "";
-      return rawOrigUrl || rawThumbUrl || "";
+      return "";
     }
 
+    // For non-encrypted photos: if safe raw URL exists, provide as fallback while local blob downloads
     if (isThumb) return rawThumbUrl || rawOrigUrl || "";
     return rawOrigUrl || rawThumbUrl || "";
   }
@@ -545,56 +601,14 @@
     }
   });
 
-  // Reactive automatic decryption and pre-fetching for high-res photo in venue slideshow
+  // Reactive automatic download/decryption to host temp files for venue slideshow
   $effect(() => {
     if (
       isSlideshowRoute &&
       slideshowPhotos.length > 0 &&
       slideshowPhotos[currentSlideIndex]
     ) {
-      const p = slideshowPhotos[currentSlideIndex];
-      const key = resolveEventDecryptionKey(p);
-      if (key && isPhotoEncrypted(p)) {
-        if (!p.decrypted_orig_url && !p.original_blob && !p._isDecryptingOrig) {
-          p._isDecryptingOrig = true;
-          db.getDecryptedOriginalBlob(p, key)
-            .then((blob) => {
-              if (blob) {
-                const url = db.getCachedObjectURL(blob, `orig_${p.id || p.filename}`);
-                p.decrypted_orig_url = url;
-                p.original_blob = blob;
-                p._isDecryptingOrig = false;
-                slideshowPhotos[currentSlideIndex] = { ...p };
-                slideshowPhotos = [...slideshowPhotos];
-              }
-            })
-            .catch((e) => {
-              console.warn("Could not decrypt full original for slideshow slide:", e);
-              p._isDecryptingOrig = false;
-            });
-        }
-
-        // Pre-fetch & decrypt next slide
-        const nextIdx = (currentSlideIndex + 1) % slideshowPhotos.length;
-        const nextP = slideshowPhotos[nextIdx];
-        if (nextP && isPhotoEncrypted(nextP) && !nextP.decrypted_orig_url && !nextP.original_blob && !nextP._isDecryptingOrig) {
-          nextP._isDecryptingOrig = true;
-          db.getDecryptedOriginalBlob(nextP, key)
-            .then((blob) => {
-              if (blob) {
-                const url = db.getCachedObjectURL(blob, `orig_${nextP.id || nextP.filename}`);
-                nextP.decrypted_orig_url = url;
-                nextP.original_blob = blob;
-                nextP._isDecryptingOrig = false;
-                slideshowPhotos[nextIdx] = { ...nextP };
-                slideshowPhotos = [...slideshowPhotos];
-              }
-            })
-            .catch(() => {
-              nextP._isDecryptingOrig = false;
-            });
-        }
-      }
+      prepareSlideshowPhotos(slideshowPhotos, currentSlideIndex);
     }
   });
 
@@ -3630,25 +3644,8 @@
         slideshowPhotos = p;
       });
 
-      // 6. Pre-decrypt active slide original blob immediately
-      if (slideshowPhotos.length > 0 && key) {
-        const cur = slideshowPhotos[currentSlideIndex];
-        if (cur && isPhotoEncrypted(cur) && !cur.decrypted_orig_url && !cur.original_blob && !cur._isDecryptingOrig) {
-          cur._isDecryptingOrig = true;
-          db.getDecryptedOriginalBlob(cur, key).then((blob) => {
-            if (blob) {
-              const url = db.getCachedObjectURL(blob, `orig_${cur.id || cur.filename}`);
-              cur.decrypted_orig_url = url;
-              cur.original_blob = blob;
-              cur._isDecryptingOrig = false;
-              if (slideshowPhotos[currentSlideIndex]) {
-                slideshowPhotos[currentSlideIndex] = { ...cur };
-                slideshowPhotos = [...slideshowPhotos];
-              }
-            }
-          }).catch(() => { cur._isDecryptingOrig = false; });
-        }
-      }
+      // 6. Download and cache photos into host temp files (active slide first, then queue background)
+      prepareSlideshowPhotos(slideshowPhotos, currentSlideIndex);
 
       lastCloudSyncTime = new Date();
     } catch (err) {
@@ -3693,30 +3690,13 @@
       currentSlideIndex = 0;
       startSlideshowTimer();
 
+      // Download and cache photos into host temp files (active slide first, then queue background)
+      prepareSlideshowPhotos(slideshowPhotos, 0);
+
       // Decrypt thumbnails in background
       decryptPhotosList(slideshowPhotos).then((p) => {
         slideshowPhotos = p;
       });
-
-      // Decrypt active first slide original blob immediately
-      if (slideshowPhotos.length > 0 && key) {
-        const first = slideshowPhotos[0];
-        if (first && isPhotoEncrypted(first) && !first.decrypted_orig_url && !first.original_blob) {
-          first._isDecryptingOrig = true;
-          db.getDecryptedOriginalBlob(first, key).then((blob) => {
-            if (blob) {
-              const url = db.getCachedObjectURL(blob, `orig_${first.id || first.filename}`);
-              first.decrypted_orig_url = url;
-              first.original_blob = blob;
-              first._isDecryptingOrig = false;
-              if (slideshowPhotos[0]) {
-                slideshowPhotos[0] = { ...first };
-                slideshowPhotos = [...slideshowPhotos];
-              }
-            }
-          }).catch(() => { first._isDecryptingOrig = false; });
-        }
-      }
 
       // Start auto-refresh polling interval
       startSlideshowAutoRefresh(cleanSlug);
@@ -4149,11 +4129,13 @@
                   src={getPhotoSrc(slideshowPhotos[currentSlideIndex], false)}
                   alt="Slideshow memory"
                   class="slide-img"
+                  loading="eager"
+                  onerror={(e) => handleSlideshowImgError(e, currentSlideIndex)}
                 />
               {:else}
                 <div class="slideshow-slide-loading" style="display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; gap: 1rem; color: #fff;">
                   <div class="spinner" style="width: 48px; height: 48px;"></div>
-                  <p style="font-size: 1.125rem; opacity: 0.85;">Decrypting memory...</p>
+                  <p style="font-size: 1.125rem; opacity: 0.85;">Loading memory...</p>
                 </div>
               {/if}
             </div>
@@ -4194,11 +4176,11 @@
             </div>
           {/if}
 
-          <!-- CLOUD AUTO-SYNC STATUS BADGE -->
+          <!-- CLOUD AUTO-SYNC & LOCAL TEMP CACHE BADGE -->
           {#if storage.isStorageConfigured()}
-            <div class="slideshow-cloud-pill" title="Live auto-refreshing from Supabase Cloud Storage">
+            <div class="slideshow-cloud-pill" title="Live sync & local host temp caching">
               <span class="pulse-dot {isSlideshowSyncing ? 'syncing' : ''}"></span>
-              <span>Cloud Sync</span>
+              <span>{slideshowPhotos.filter(p => p.decrypted_orig_url || p.original_blob).length}/{slideshowPhotos.length} Cached</span>
             </div>
           {/if}
 
