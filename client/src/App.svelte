@@ -229,11 +229,10 @@
   let cameraErrorMsg = $state("");
   let isSnapping = $state(false);
 
-  // Photo Studio & Frame Preview State
+  // Photo Studio Preview & Caption State
   let isPhotoStudioOpen = $state(false);
   let studioFile = $state(null);
   let studioPreviewBlobUrl = $state("");
-  let studioUseFrame = $state(true);
   let studioCaption = $state("");
   let isSubmittingStudio = $state(false);
 
@@ -2896,35 +2895,8 @@
     }
     studioFile = file;
     studioPreviewBlobUrl = URL.createObjectURL(file);
-    const hasFrameConfigured = Boolean(
-      (guestEventData?.frame_url) ||
-      (guestEventData?.frame_config && guestEventData.frame_config.type && guestEventData.frame_config.type !== "none")
-    );
-    studioUseFrame = hasFrameConfigured;
     studioCaption = "";
     isPhotoStudioOpen = true;
-    setTimeout(updateStudioCanvasPreview, 40);
-  }
-
-  function updateStudioCanvasPreview() {
-    if (!studioCanvasEl || !studioPreviewBlobUrl) return;
-    const img = new Image();
-    img.crossOrigin = "anonymous";
-    img.src = studioPreviewBlobUrl;
-    img.onload = () => {
-      let frameConfig = null;
-      if (studioUseFrame && guestEventData) {
-        if (guestEventData.frame_config && typeof guestEventData.frame_config === "object") {
-          frameConfig = guestEventData.frame_config;
-        } else if (guestEventData.frame_url) {
-          frameConfig = { type: "custom", url: guestEventData.frame_url };
-        }
-      }
-      renderFramedPhotoToCanvas(img, frameConfig, studioCanvasEl, {
-        eventTitle: guestEventData?.name || "",
-        eventDate: guestEventData?.date || ""
-      });
-    };
   }
 
   function handleClosePhotoStudio() {
@@ -2956,25 +2928,10 @@
     isSubmittingStudio = true;
     const fileToUpload = studioFile;
     const captionText = studioCaption.trim();
-    const useFrame = studioUseFrame;
-
-    let frameConfig = null;
-    if (useFrame && guestEventData) {
-      if (guestEventData.frame_config && typeof guestEventData.frame_config === "object") {
-        frameConfig = guestEventData.frame_config;
-      } else if (guestEventData.frame_url) {
-        frameConfig = {
-          type: "custom",
-          url: guestEventData.frame_url
-        };
-      }
-    }
 
     handleClosePhotoStudio();
 
     await processSinglePhotoUpload(fileToUpload, {
-      frameConfig,
-      hasFrame: Boolean(useFrame && frameConfig),
       caption: captionText
     });
   }
@@ -6715,51 +6672,14 @@
         </div>
 
         <div class="photo-studio-body" style="padding: 1rem 1.25rem;">
-          <!-- Preview Canvas / Image -->
+          <!-- Preview Image -->
           <div class="photo-studio-preview-wrapper">
-            {#if studioUseFrame && (guestEventData?.frame_url || (guestEventData?.frame_config && guestEventData.frame_config.type !== "none"))}
-              <canvas
-                bind:this={studioCanvasEl}
-                width="600"
-                height="750"
-                class="photo-studio-canvas-preview"
-              ></canvas>
-            {:else}
-              <img
-                src={studioPreviewBlobUrl}
-                alt="Raw capture preview"
-                class="photo-studio-raw-img"
-              />
-            {/if}
+            <img
+              src={studioPreviewBlobUrl}
+              alt="Raw capture preview"
+              class="photo-studio-raw-img"
+            />
           </div>
-
-          <!-- Framing Toggle -->
-          {#if guestEventData?.frame_url || (guestEventData?.frame_config && guestEventData.frame_config.type !== "none")}
-            <div class="photo-studio-frame-toggle-row">
-              <span class="toggle-label">Framing:</span>
-              <div class="frame-toggle-pills">
-                <button
-                  type="button"
-                  class="frame-toggle-btn {studioUseFrame ? 'active' : ''}"
-                  onclick={() => {
-                    studioUseFrame = true;
-                    setTimeout(updateStudioCanvasPreview, 40);
-                  }}
-                >
-                  🖼️ Framed Photo
-                </button>
-                <button
-                  type="button"
-                  class="frame-toggle-btn {!studioUseFrame ? 'active' : ''}"
-                  onclick={() => {
-                    studioUseFrame = false;
-                  }}
-                >
-                  📷 Direct Photo (No Frame)
-                </button>
-              </div>
-            </div>
-          {/if}
 
           <!-- Optional 1-Line Caption Section -->
           <div class="photo-studio-caption-section">
