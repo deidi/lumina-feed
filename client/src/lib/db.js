@@ -1074,22 +1074,47 @@ export async function getPhotos(slug, options = {}) {
 }
 
 /**
+ * Extract relative storage path from full CDN URL or partial path
+ */
+function extractStoragePath(urlOrPath, bucket) {
+  if (!urlOrPath) return '';
+  const bucketPrefix = `/storage/v1/object/public/${bucket}/`;
+  const idx = urlOrPath.indexOf(bucketPrefix);
+  if (idx !== -1) {
+    return decodeURIComponent(urlOrPath.substring(idx + bucketPrefix.length).split('?')[0]);
+  }
+  return String(urlOrPath).replace(/^\/+/, '').split('?')[0];
+}
+
+/**
  * Ensure photo decryption across E2EE events
  */
 export async function ensurePhotoDecrypted(photo, key = '') {
-  if (!photo || !photo.is_encrypted) return photo;
+  if (!photo) return photo;
+  const isEnc = Boolean(
+    photo.is_encrypted ||
+    photo.filename?.includes('.enc') ||
+    photo.filename?.includes('.lenc') ||
+    photo.storage_thumb_path?.includes('.enc') ||
+    photo.storage_thumb_path?.includes('.lenc') ||
+    photo.storage_orig_path?.includes('.enc') ||
+    photo.storage_orig_path?.includes('.lenc')
+  );
+  if (!isEnc) return photo;
   if (photo.decrypted_thumb_url && photo.decrypted_orig_url) return photo;
 
   try {
-    const eventKey = (key || getStoredEventKey(photo.event_slug) || '').trim();
+    const eventKey = (key || getStoredEventKey(photo.event_slug) || photo.encryption_key || '').trim();
     if (!eventKey) return photo;
 
     const client = getSupabaseClient();
     const { bucket } = getBaaSConfig();
 
-    if (photo.storage_thumb_path && !photo.decrypted_thumb_url) {
-      const { data: blob } = await client.storage.from(bucket).download(photo.storage_thumb_path);
-      if (blob) {
+    const rawPath = photo.storage_thumb_path || photo.storage_orig_path || photo.thumb_url || photo.original_url;
+    const targetThumbPath = extractStoragePath(rawPath, bucket);
+    if (targetThumbPath && !photo.decrypted_thumb_url) {
+      const { data: blob, error } = await client.storage.from(bucket).download(targetThumbPath);
+      if (blob && !error) {
         const decrypted = await decryptBlob(blob, eventKey);
         photo.decrypted_thumb_url = URL.createObjectURL(decrypted);
         photo.thumb_blob = decrypted;
@@ -1098,6 +1123,7 @@ export async function ensurePhotoDecrypted(photo, key = '') {
 
     return photo;
   } catch (err) {
+    console.warn('ensurePhotoDecrypted error:', err);
     return photo;
   }
 }
@@ -1107,22 +1133,31 @@ export async function ensurePhotoDecrypted(photo, key = '') {
  */
 export async function getDecryptedOriginalBlob(photo, key = '') {
   if (!photo) return null;
-  const eventKey = (key || getStoredEventKey(photo.event_slug) || '').trim();
+  const eventKey = (key || getStoredEventKey(photo.event_slug) || photo.encryption_key || '').trim();
 
   try {
     const client = getSupabaseClient();
     const { bucket } = getBaaSConfig();
-    const targetPath = photo.storage_orig_path || photo.storage_thumb_path;
+    const rawPath = photo.storage_orig_path || photo.storage_thumb_path || photo.original_url || photo.thumb_url;
+    const targetPath = extractStoragePath(rawPath, bucket);
     if (!targetPath) return null;
 
-    const { data: blob } = await client.storage.from(bucket).download(targetPath);
-    if (!blob) return null;
+    const { data: blob, error } = await client.storage.from(bucket).download(targetPath);
+    if (!blob || error) return null;
 
-    if (photo.is_encrypted && eventKey) {
+    const isEnc = Boolean(
+      photo.is_encrypted ||
+      photo.filename?.includes('.enc') ||
+      photo.filename?.includes('.lenc') ||
+      targetPath.includes('.enc') ||
+      targetPath.includes('.lenc')
+    );
+    if (isEnc && eventKey) {
       return await decryptBlob(blob, eventKey);
     }
     return blob;
-  } catch (_) {
+  } catch (err) {
+    console.warn('getDecryptedOriginalBlob error:', err);
     return null;
   }
 }

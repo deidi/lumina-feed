@@ -260,9 +260,51 @@
     }
   }
 
+  function resolveEventDecryptionKey(photoOrSlug) {
+    let slug = typeof photoOrSlug === "string" ? photoOrSlug : (photoOrSlug?.event_slug || currentEventSlug || selectedEvent?.slug || guestEventData?.slug || "");
+    let key = slug ? crypto.getStoredEventKey(slug) : "";
+    if (!key && typeof photoOrSlug === "object" && photoOrSlug) {
+      key = photoOrSlug?.encryption_key || "";
+    }
+    if (!key && selectedEvent?.encryption_key && (!slug || selectedEvent?.slug === slug)) {
+      key = selectedEvent.encryption_key;
+    }
+    if (!key && guestEventData?.encryption_key && (!slug || guestEventData?.slug === slug)) {
+      key = guestEventData.encryption_key;
+    }
+    if (key && slug && !crypto.getStoredEventKey(slug)) {
+      crypto.setStoredEventKey(slug, key);
+    }
+    return key;
+  }
+
+  function isPhotoEncrypted(photo) {
+    if (!photo) return false;
+    if (photo.is_encrypted || photo.e2ee_enabled) return true;
+    const path = photo.storage_orig_path || photo.storage_thumb_path || photo.storage_orig_url || photo.storage_thumb_url || photo.original_url || photo.thumb_url || photo.filename || "";
+    return Boolean(path.includes(".enc") || path.includes(".lenc"));
+  }
+
+  function triggerPhotosRefresh(photo) {
+    if (!photo) return;
+    if (selectedPreviewPhoto && (selectedPreviewPhoto.id === photo.id || (photo.storage_orig_path && selectedPreviewPhoto.storage_orig_path === photo.storage_orig_path))) {
+      selectedPreviewPhoto = { ...selectedPreviewPhoto, ...photo };
+    }
+    if (isSlideshowRoute) {
+      slideshowPhotos = [...slideshowPhotos];
+    } else if (isGuestRoute) {
+      liveGalleryPhotos = [...liveGalleryPhotos];
+      myUploads = [...myUploads];
+    } else {
+      approvedPhotos = [...approvedPhotos];
+      pendingPhotos = [...pendingPhotos];
+    }
+  }
+
   function getPhotoSrc(photo, isThumb = true) {
     if (!photo) return "";
     if (typeof photo === "string") return photo;
+
     if (isThumb) {
       if (photo.decrypted_thumb_url) return photo.decrypted_thumb_url;
       if (photo.thumb_blob) return db.getCachedObjectURL(photo.thumb_blob, `thumb_${photo.id}`);
@@ -274,31 +316,15 @@
       const rawOrigUrl = photo.storage_orig_url || photo.original_url || photo.original_path || "";
       const primaryUrl = rawThumbUrl || rawOrigUrl;
 
-      // Only treat as encrypted if the actual storage file path/URL is a .enc encrypted ciphertext blob
-      const isEncFile = Boolean(
-        (primaryUrl && primaryUrl.includes(".enc")) ||
-        (photo.filename && photo.filename.endsWith(".enc")) ||
-        (photo.storage_thumb_path && photo.storage_thumb_path.includes(".enc")) ||
-        (photo.storage_orig_path && photo.storage_orig_path.includes(".enc"))
-      );
-
-      if (isEncFile) {
-        const key = currentEventSlug ? crypto.getStoredEventKey(currentEventSlug) : "";
-        if (key && photo.id && !photo._isDecrypting) {
-          photo._isDecrypting = true;
+      if (isPhotoEncrypted(photo)) {
+        const key = resolveEventDecryptionKey(photo);
+        if (key && !photo._isDecryptingThumb) {
+          photo._isDecryptingThumb = true;
           db.ensurePhotoDecrypted(photo, key).then((res) => {
             if (res && res.thumb_blob) {
               const url = db.getCachedObjectURL(res.thumb_blob, `thumb_${photo.id}`);
               photo.decrypted_thumb_url = url;
-              if (isGuestRoute) {
-                liveGalleryPhotos = [...liveGalleryPhotos];
-                myUploads = [...myUploads];
-              } else if (isSlideshowRoute) {
-                slideshowPhotos = [...slideshowPhotos];
-              } else {
-                approvedPhotos = [...approvedPhotos];
-                pendingPhotos = [...pendingPhotos];
-              }
+              triggerPhotosRefresh(photo);
             }
           }).catch(() => {});
         }
@@ -308,6 +334,7 @@
       return primaryUrl;
     }
 
+    // Full resolution original
     if (photo.decrypted_orig_url) return photo.decrypted_orig_url;
     if (photo.original_blob) return db.getCachedObjectURL(photo.original_blob, `orig_${photo.id}`);
     if (photo.decrypted_thumb_url) return photo.decrypted_thumb_url;
@@ -317,27 +344,31 @@
     const rawThumbUrl = photo.storage_thumb_url || photo.thumb_url || photo.thumbnail_path || "";
     const primaryUrl = rawOrigUrl || rawThumbUrl;
 
-    const isEncFile = Boolean(
-      (primaryUrl && primaryUrl.includes(".enc")) ||
-      (photo.filename && photo.filename.endsWith(".enc")) ||
-      (photo.storage_orig_path && photo.storage_orig_path.includes(".enc"))
-    );
-
-    if (isEncFile) {
-      const key = currentEventSlug ? crypto.getStoredEventKey(currentEventSlug) : "";
-      if (key && !photo._isDecryptingOrig) {
-        photo._isDecryptingOrig = true;
-        db.getDecryptedOriginalBlob(photo, key).then((blob) => {
-          if (blob) {
-            const url = URL.createObjectURL(blob);
-            photo.decrypted_orig_url = url;
-            if (isSlideshowRoute) {
-              slideshowPhotos = [...slideshowPhotos];
+    if (isPhotoEncrypted(photo)) {
+      const key = resolveEventDecryptionKey(photo);
+      if (key) {
+        if (!photo.decrypted_orig_url && !photo._isDecryptingOrig) {
+          photo._isDecryptingOrig = true;
+          db.getDecryptedOriginalBlob(photo, key).then((blob) => {
+            if (blob) {
+              const url = URL.createObjectURL(blob);
+              photo.decrypted_orig_url = url;
+              triggerPhotosRefresh(photo);
             }
-          }
-        }).catch(() => {});
+          }).catch(() => {});
+        }
+        if (!photo.decrypted_thumb_url && !photo._isDecryptingThumb) {
+          photo._isDecryptingThumb = true;
+          db.ensurePhotoDecrypted(photo, key).then((res) => {
+            if (res && res.thumb_blob) {
+              const url = db.getCachedObjectURL(res.thumb_blob, `thumb_${photo.id}`);
+              photo.decrypted_thumb_url = url;
+              triggerPhotosRefresh(photo);
+            }
+          }).catch(() => {});
+        }
       }
-      return photo.decrypted_thumb_url || (photo.thumb_blob ? db.getCachedObjectURL(photo.thumb_blob, `thumb_${photo.id}`) : "");
+      return photo.decrypted_thumb_url || (photo.thumb_blob ? db.getCachedObjectURL(photo.thumb_blob, `thumb_${photo.id}`) : "") || "";
     }
 
     return primaryUrl;
@@ -345,7 +376,7 @@
 
   async function decryptPhotosList(photosList) {
     if (!photosList || photosList.length === 0) return photosList;
-    const key = currentEventSlug ? crypto.getStoredEventKey(currentEventSlug) : "";
+    const key = resolveEventDecryptionKey(photosList[0]);
     if (!key) return photosList;
 
     let hasUpdates = false;
@@ -357,12 +388,7 @@
           hasUpdates = true;
           return { ...p, decrypted_thumb_url: url };
         }
-        const isEnc = Boolean(
-          p.filename?.endsWith(".enc") ||
-          p.storage_thumb_path?.includes(".enc") ||
-          p.storage_orig_path?.includes(".enc")
-        );
-        if (!isEnc) return p;
+        if (!isPhotoEncrypted(p)) return p;
         try {
           const decrypted = await db.ensurePhotoDecrypted(p, key);
           if (decrypted && decrypted.thumb_blob) {
@@ -382,20 +408,23 @@
   $effect(() => {
     if (
       selectedPreviewPhoto &&
-      selectedPreviewPhoto.is_encrypted &&
+      isPhotoEncrypted(selectedPreviewPhoto) &&
       !selectedPreviewPhoto.decrypted_orig_url &&
       !selectedPreviewPhoto.original_blob
     ) {
       const p = selectedPreviewPhoto;
-      const key = currentEventSlug ? crypto.getStoredEventKey(currentEventSlug) : "";
-      db.getDecryptedOriginalBlob(p, key)
-        .then((blob) => {
-          if (blob && selectedPreviewPhoto && selectedPreviewPhoto.id === p.id) {
-            const url = URL.createObjectURL(blob);
-            selectedPreviewPhoto = { ...p, decrypted_orig_url: url };
-          }
-        })
-        .catch((e) => console.warn("Could not decrypt full original for preview:", e));
+      const key = resolveEventDecryptionKey(p);
+      if (key && !p._isDecryptingOrig) {
+        p._isDecryptingOrig = true;
+        db.getDecryptedOriginalBlob(p, key)
+          .then((blob) => {
+            if (blob && selectedPreviewPhoto && (selectedPreviewPhoto.id === p.id || (p.storage_orig_path && selectedPreviewPhoto.storage_orig_path === p.storage_orig_path))) {
+              const url = URL.createObjectURL(blob);
+              selectedPreviewPhoto = { ...p, decrypted_orig_url: url };
+            }
+          })
+          .catch((e) => console.warn("Could not decrypt full original for preview:", e));
+      }
     }
   });
 
@@ -407,18 +436,20 @@
       slideshowPhotos[currentSlideIndex]
     ) {
       const p = slideshowPhotos[currentSlideIndex];
-      const isEnc = Boolean(p.is_encrypted || p.filename?.includes(".enc") || p.storage_orig_url?.includes(".enc") || p.original_url?.includes(".enc"));
-      if (isEnc && !p.decrypted_orig_url && !p.original_blob && !p._isDecryptingOrig) {
+      if (isPhotoEncrypted(p) && !p.decrypted_orig_url && !p.original_blob && !p._isDecryptingOrig) {
         p._isDecryptingOrig = true;
-        const key = currentEventSlug ? crypto.getStoredEventKey(currentEventSlug) : "";
-        db.getDecryptedOriginalBlob(p, key)
-          .then((blob) => {
-            if (blob) {
-              const url = URL.createObjectURL(blob);
-              slideshowPhotos[currentSlideIndex] = { ...p, decrypted_orig_url: url };
-            }
-          })
-          .catch((e) => console.warn("Could not decrypt full original for slideshow slide:", e));
+        const key = resolveEventDecryptionKey(p);
+        if (key) {
+          db.getDecryptedOriginalBlob(p, key)
+            .then((blob) => {
+              if (blob) {
+                const url = URL.createObjectURL(blob);
+                slideshowPhotos[currentSlideIndex] = { ...p, decrypted_orig_url: url };
+                slideshowPhotos = [...slideshowPhotos];
+              }
+            })
+            .catch((e) => console.warn("Could not decrypt full original for slideshow slide:", e));
+        }
       }
     }
   });
@@ -573,7 +604,9 @@
     const basePath = path.endsWith(".html")
       ? path.substring(0, path.lastIndexOf("/"))
       : path.replace(/\/$/, "");
-    const url = `${origin}${basePath}/#/event/${slug}/slideshow`;
+    const key = resolveEventDecryptionKey(slug);
+    const keyQuery = key ? `?key=${encodeURIComponent(key)}` : "";
+    const url = `${origin}${basePath}/#/event/${slug}/slideshow${keyQuery}`;
     window.open(url, "_blank");
   }
 
@@ -3980,15 +4013,22 @@
               class="slide-item-wrapper transition-{slideshowConfig.transition ||
                 'fade'}"
             >
-              <div
-                class="slide-backdrop-blur"
-                style="background-image: url('{getPhotoSrc(slideshowPhotos[currentSlideIndex], false)}');"
-              ></div>
-              <img
-                src={getPhotoSrc(slideshowPhotos[currentSlideIndex], false)}
-                alt="Slideshow memory"
-                class="slide-img"
-              />
+              {#if getPhotoSrc(slideshowPhotos[currentSlideIndex], false)}
+                <div
+                  class="slide-backdrop-blur"
+                  style="background-image: url('{getPhotoSrc(slideshowPhotos[currentSlideIndex], false)}');"
+                ></div>
+                <img
+                  src={getPhotoSrc(slideshowPhotos[currentSlideIndex], false)}
+                  alt="Slideshow memory"
+                  class="slide-img"
+                />
+              {:else}
+                <div class="slideshow-slide-loading" style="display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; gap: 1rem; color: #fff;">
+                  <div class="spinner" style="width: 48px; height: 48px;"></div>
+                  <p style="font-size: 1.125rem; opacity: 0.85;">Decrypting memory...</p>
+                </div>
+              {/if}
             </div>
           {/key}
 
@@ -6823,11 +6863,18 @@
         </div>
 
         <div class="lightbox-img-wrapper">
-          <img
-            src={getPhotoSrc(selectedPreviewPhoto, false)}
-            alt="Full resolution capture"
-            class="lightbox-img"
-          />
+          {#if getPhotoSrc(selectedPreviewPhoto, false)}
+            <img
+              src={getPhotoSrc(selectedPreviewPhoto, false)}
+              alt={selectedPreviewPhoto.caption || "Full resolution capture"}
+              class="lightbox-img"
+            />
+          {:else}
+            <div class="lightbox-loading-box" style="display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 280px; gap: 0.75rem; color: var(--color-text-muted);">
+              <div class="spinner-small" style="width: 32px; height: 32px;"></div>
+              <span>Decrypting & loading photo...</span>
+            </div>
+          {/if}
         </div>
 
         {#if selectedPreviewPhoto.caption}
