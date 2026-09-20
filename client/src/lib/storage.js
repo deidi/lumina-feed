@@ -565,12 +565,16 @@ export async function uploadPhotoToStorage({
   origBlob,
   originalBlob,
   blob,
+  thumbBlob,
+  thumbnailBlob,
+  thumb_blob,
   mimeType = 'image/jpeg',
   encryptionKey = '',
   caption = '',
   hasFrame = false,
   guestName = 'Guest',
   guestToken = '',
+  metadata = {},
 }) {
   // Pre-Flight Connectivity Check
   await preFlightUploadCheck(3500);
@@ -582,8 +586,12 @@ export async function uploadPhotoToStorage({
   }
 
   // Check Guest Quota
-  if (guestToken) {
-    const guestQuota = await checkGuestUploadQuota(eventSlug, guestToken);
+  const effectiveGuestToken = guestToken || metadata?.guest_token || '';
+  const effectiveCaption = caption || metadata?.caption || '';
+  const effectiveHasFrame = Boolean(hasFrame || metadata?.has_frame);
+  const effectiveGuestName = guestName || metadata?.guest_name || 'Guest';
+  if (effectiveGuestToken) {
+    const guestQuota = await checkGuestUploadQuota(eventSlug, effectiveGuestToken);
     if (!guestQuota.allowed) {
       throw new Error(`Guest upload quota reached (maximum ${GUEST_MAX_PHOTOS_LIMIT} photos per guest).`);
     }
@@ -602,7 +610,7 @@ export async function uploadPhotoToStorage({
   const isEncrypted = Boolean(key);
 
   let rawOrigBlob = origBlob || originalBlob || blob;
-  let rawThumbBlob = thumbBlob;
+  let rawThumbBlob = thumbBlob || thumbnailBlob || thumb_blob;
 
   if ((!rawOrigBlob || rawOrigBlob.size === 0) && rawThumbBlob && rawThumbBlob.size > 0) {
     rawOrigBlob = rawThumbBlob;
@@ -672,10 +680,10 @@ export async function uploadPhotoToStorage({
       thumbUrl,
       bucket,
       isEncrypted,
-      caption,
-      hasFrame,
-      guestName,
-      guestToken,
+      caption: effectiveCaption,
+      hasFrame: effectiveHasFrame,
+      guestName: effectiveGuestName,
+      guestToken: effectiveGuestToken,
     };
   }, 2, 15000);
 }
