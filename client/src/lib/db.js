@@ -450,6 +450,9 @@ export async function validateAndFetchEvent(slug) {
 
     if (dbEvent) {
       const storedKey = getStoredEventKey(cleanSlug) || dbEvent.encryption_key || '';
+      if (storedKey) {
+        setStoredEventKey(cleanSlug, storedKey);
+      }
       return {
         ...dbEvent,
         status: dbEvent.status || 'active',
@@ -619,7 +622,19 @@ export async function updateEvent(slugOrId, updates = {}) {
   }
   if (updates.moderation_enabled !== undefined) patch.moderation_enabled = Boolean(updates.moderation_enabled);
   if (updates.auto_approve !== undefined) patch.auto_approve = Boolean(updates.auto_approve);
-  if (updates.e2ee_enabled !== undefined) patch.e2ee_enabled = Boolean(updates.e2ee_enabled);
+  if (updates.e2ee_enabled !== undefined || updates.is_encrypted !== undefined) {
+    const isEnc = Boolean(updates.e2ee_enabled !== undefined ? updates.e2ee_enabled : updates.is_encrypted);
+    patch.e2ee_enabled = isEnc;
+    patch.is_encrypted = isEnc;
+    if (isEnc) {
+      let existingKey = getStoredEventKey(cleanSlug);
+      if (!existingKey) {
+        existingKey = generateEventKey();
+        setStoredEventKey(cleanSlug, existingKey);
+      }
+      patch.encryption_key = existingKey;
+    }
+  }
   if (updates.allow_guest_downloads !== undefined) patch.allow_guest_downloads = Boolean(updates.allow_guest_downloads);
   if (updates.frame_url !== undefined) patch.frame_url = updates.frame_url;
   if (updates.frame_config !== undefined) patch.frame_config = updates.frame_config;
@@ -1348,6 +1363,17 @@ export const db = {
     delete: async () => {}
   },
   photos: {
+    add: async (photo) => {
+      if (!photo) return null;
+      if (isStorageConfigured()) {
+        try {
+          const client = getSupabaseClient();
+          const { data } = await safeSupabaseUpsert(client, 'photos', photo);
+          if (data && data[0]?.id) return data[0].id;
+        } catch (_) {}
+      }
+      return photo.id || generateSecureToken('photo');
+    },
     get: async (id) => {
       if (!isStorageConfigured() || !id) return null;
       try {
@@ -1374,10 +1400,27 @@ export const db = {
     },
     where: (field) => ({
       equals: (val) => ({
+        first: async () => {
+          if (!isStorageConfigured() || !val) return null;
+          try {
+            const client = getSupabaseClient();
+            const { data } = await client.from('photos').select('*').eq(field, val).maybeSingle();
+            return data;
+          } catch (_) {
+            return null;
+          }
+        },
         toArray: async () => {
           if (field === 'event_slug') {
             const res = await getPhotos(val);
             return res.photos || [];
+          }
+          if (isStorageConfigured()) {
+            try {
+              const client = getSupabaseClient();
+              const { data } = await client.from('photos').select('*').eq(field, val);
+              return data || [];
+            } catch (_) {}
           }
           return [];
         },
@@ -1387,22 +1430,63 @@ export const db = {
             const client = getSupabaseClient();
             await client.from('photos').delete().eq(field, val);
           } catch (_) {}
+        },
+        modify: async (patch) => {
+          if (!isStorageConfigured()) return;
+          try {
+            const client = getSupabaseClient();
+            await client.from('photos').update(patch).eq(field, val);
+          } catch (_) {}
         }
       })
     }),
     toArray: async () => []
   },
   guests: {
+    add: async (guest) => {
+      if (!guest) return null;
+      if (isStorageConfigured()) {
+        try {
+          const client = getSupabaseClient();
+          const { data } = await safeSupabaseUpsert(client, 'guests', guest);
+          if (data && data[0]?.id) return data[0].id;
+        } catch (_) {}
+      }
+      return guest.id || generateSecureToken('guest');
+    },
+    update: async (id, patch) => {
+      if (!isStorageConfigured() || !id) return;
+      try {
+        const client = getSupabaseClient();
+        await client.from('guests').update(patch).eq('id', id);
+      } catch (_) {}
+    },
     where: (field) => ({
       equals: (val) => ({
+        first: async () => {
+          if (!isStorageConfigured() || !val) return null;
+          try {
+            const client = getSupabaseClient();
+            const { data } = await client.from('guests').select('*').eq(field, val).maybeSingle();
+            return data;
+          } catch (_) {
+            return null;
+          }
+        },
         toArray: async () => {
           if (field === 'event_slug') {
             const res = await getGuests(val);
             return res.guests || [];
           }
+          if (isStorageConfigured()) {
+            try {
+              const client = getSupabaseClient();
+              const { data } = await client.from('guests').select('*').eq(field, val);
+              return data || [];
+            } catch (_) {}
+          }
           return [];
         },
-        first: async () => null,
         delete: async () => {
           if (!isStorageConfigured()) return;
           try {
@@ -1410,7 +1494,13 @@ export const db = {
             await client.from('guests').delete().eq(field, val);
           } catch (_) {}
         },
-        modify: async (updater) => {}
+        modify: async (patch) => {
+          if (!isStorageConfigured()) return;
+          try {
+            const client = getSupabaseClient();
+            await client.from('guests').update(patch).eq(field, val);
+          } catch (_) {}
+        }
       })
     })
   },

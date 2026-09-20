@@ -4452,12 +4452,19 @@
                 {/if}
 
                 <div class="live-dot-badge">
-                  <span class="pulse-dot"></span>
                   <span
-                    >{wsConnectionStatus === "connected"
+                    class="pulse-dot"
+                    style="background: {wsConnectionStatus === 'connected' ? '#10b981' : wsConnectionStatus === 'connecting' ? '#f59e0b' : '#34d399'};"
+                  ></span>
+                  <span>
+                    {wsConnectionStatus === "connected"
                       ? "Live Sync"
-                      : "Reconnecting..."}</span
-                  >
+                      : wsConnectionStatus === "connecting"
+                      ? "Connecting..."
+                      : wsConnectionStatus === "reconnecting"
+                      ? "Reconnecting..."
+                      : "Cloud Sync"}
+                  </span>
                 </div>
               </div>
             </div>
