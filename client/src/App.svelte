@@ -261,18 +261,25 @@
 
   function resolveEventDecryptionKey(photoOrSlug) {
     let slug = typeof photoOrSlug === "string" ? photoOrSlug : (photoOrSlug?.event_slug || currentEventSlug || selectedEvent?.slug || guestEventData?.slug || "");
-    let key = slug ? crypto.getStoredEventKey(slug) : "";
+    let cleanSlug = String(slug || "").trim().toLowerCase();
+    let key = cleanSlug ? crypto.getStoredEventKey(cleanSlug) : "";
     if (!key && typeof photoOrSlug === "object" && photoOrSlug) {
       key = photoOrSlug?.encryption_key || "";
     }
-    if (!key && selectedEvent?.encryption_key && (!slug || selectedEvent?.slug === slug)) {
-      key = selectedEvent.encryption_key;
+    if (!key && selectedEvent && (!cleanSlug || String(selectedEvent.slug).trim().toLowerCase() === cleanSlug)) {
+      key = selectedEvent.encryption_key || "";
     }
-    if (!key && guestEventData?.encryption_key && (!slug || guestEventData?.slug === slug)) {
-      key = guestEventData.encryption_key;
+    if (!key && guestEventData && (!cleanSlug || String(guestEventData.slug).trim().toLowerCase() === cleanSlug)) {
+      key = guestEventData.encryption_key || "";
     }
-    if (key && slug && !crypto.getStoredEventKey(slug)) {
-      crypto.setStoredEventKey(slug, key);
+    if (!key && events && events.length > 0) {
+      const matchedEvent = events.find((e) => String(e.slug).trim().toLowerCase() === cleanSlug);
+      if (matchedEvent?.encryption_key) {
+        key = matchedEvent.encryption_key;
+      }
+    }
+    if (key && cleanSlug) {
+      crypto.setStoredEventKey(cleanSlug, key);
     }
     return key;
   }
@@ -302,7 +309,7 @@
 
   function openPhotoPreview(photo) {
     if (!photo) return;
-    selectedPreviewPhoto = photo;
+    selectedPreviewPhoto = { ...photo };
     if (isPhotoEncrypted(photo)) {
       const key = resolveEventDecryptionKey(photo);
       if (key) {
@@ -315,6 +322,9 @@
                 photo.decrypted_orig_url = url;
                 photo.original_blob = blob;
                 photo._isDecryptingOrig = false;
+                if (selectedPreviewPhoto && (selectedPreviewPhoto.id === photo.id || (photo.storage_orig_path && selectedPreviewPhoto.storage_orig_path === photo.storage_orig_path) || (photo.filename && selectedPreviewPhoto.filename === photo.filename))) {
+                  selectedPreviewPhoto = { ...selectedPreviewPhoto, decrypted_orig_url: url, original_blob: blob };
+                }
                 triggerPhotosRefresh(photo);
               }
             })
@@ -332,6 +342,9 @@
                 photo.decrypted_thumb_url = url;
                 photo.thumb_blob = res.thumb_blob;
                 photo._isDecryptingThumb = false;
+                if (selectedPreviewPhoto && !selectedPreviewPhoto.decrypted_orig_url && (selectedPreviewPhoto.id === photo.id || (photo.storage_orig_path && selectedPreviewPhoto.storage_orig_path === photo.storage_orig_path) || (photo.filename && selectedPreviewPhoto.filename === photo.filename))) {
+                  selectedPreviewPhoto = { ...selectedPreviewPhoto, decrypted_thumb_url: url, thumb_blob: res.thumb_blob };
+                }
                 triggerPhotosRefresh(photo);
               }
             })

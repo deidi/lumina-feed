@@ -1091,12 +1091,32 @@ export async function getPhotos(slug, options = {}) {
  */
 function extractStoragePath(urlOrPath, bucket) {
   if (!urlOrPath) return '';
-  const bucketPrefix = `/storage/v1/object/public/${bucket}/`;
-  const idx = urlOrPath.indexOf(bucketPrefix);
-  if (idx !== -1) {
-    return decodeURIComponent(urlOrPath.substring(idx + bucketPrefix.length).split('?')[0]);
+  const str = String(urlOrPath).trim();
+
+  // If already relative
+  if (!str.startsWith('http://') && !str.startsWith('https://')) {
+    return str.replace(/^\/+/, '').split('?')[0];
   }
-  return String(urlOrPath).replace(/^\/+/, '').split('?')[0];
+
+  // If it's a full Supabase storage URL:
+  const match = str.match(/\/storage\/v1\/object\/(?:public|sign|authenticated)\/[^/]+\/(.+)/);
+  if (match && match[1]) {
+    return decodeURIComponent(match[1].split('?')[0]);
+  }
+
+  if (bucket) {
+    const idx = str.indexOf(`/${bucket}/`);
+    if (idx !== -1) {
+      return decodeURIComponent(str.substring(idx + bucket.length + 2).split('?')[0]);
+    }
+  }
+
+  try {
+    const parsed = new URL(str);
+    return decodeURIComponent(parsed.pathname.replace(/^\/+/, ''));
+  } catch (_) {
+    return str.replace(/^\/+/, '').split('?')[0];
+  }
 }
 
 /**
@@ -1105,44 +1125,63 @@ function extractStoragePath(urlOrPath, bucket) {
 export async function ensurePhotoDecrypted(photo, key = '') {
   if (!photo) return photo;
   if (photo.thumb_blob) {
-    if (!photo.decrypted_thumb_url) {
+    if (!photo.decrypted_thumb_url || photo.decrypted_thumb_url.includes('.lenc')) {
       photo.decrypted_thumb_url = getCachedObjectURL(photo.thumb_blob, `thumb_${photo.id || photo.filename}`);
     }
     return photo;
   }
-  const rawPath = photo.storage_thumb_path || photo.storage_thumb_url || photo.storage_orig_path || photo.storage_orig_url || photo.thumb_url || photo.original_url || photo.filename || '';
-  const isEnc = Boolean(rawPath.includes('.enc') || rawPath.includes('.lenc') || photo.is_encrypted || photo.encrypted);
+
+  const directUrl = photo.storage_thumb_url || photo.thumb_url || photo.storage_orig_url || photo.original_url || '';
+  const rawPath = photo.storage_thumb_path || photo.storage_orig_path || photo.filename || '';
+  const isEnc = Boolean(
+    (rawPath && (rawPath.includes('.enc') || rawPath.includes('.lenc'))) ||
+    (directUrl && (directUrl.includes('.enc') || directUrl.includes('.lenc'))) ||
+    photo.is_encrypted ||
+    photo.encrypted
+  );
   if (!isEnc) return photo;
   if (photo.decrypted_thumb_url && !photo.decrypted_thumb_url.includes('.lenc')) return photo;
 
   try {
-    const eventKey = (key || getStoredEventKey(photo.event_slug) || photo.encryption_key || '').trim();
+    const slug = photo.event_slug || '';
+    const eventKey = (key || getStoredEventKey(slug) || photo.encryption_key || '').trim();
     if (!eventKey) return photo;
 
     const client = getSupabaseClient();
     const { bucket } = getBaaSConfig();
+    const targetThumbPath = extractStoragePath(rawPath || directUrl, bucket);
 
-    const targetThumbPath = extractStoragePath(rawPath, bucket);
-    if (targetThumbPath && (!photo.decrypted_thumb_url || photo.decrypted_thumb_url.includes('.lenc'))) {
-      let blob = null;
+    let blob = null;
+
+    // 1. Direct fetch if full URL is available
+    if (directUrl && directUrl.startsWith('http')) {
+      try {
+        const res = await fetch(directUrl);
+        if (res.ok) blob = await res.blob();
+      } catch (_) {}
+    }
+
+    // 2. Storage download
+    if (!blob && targetThumbPath) {
       try {
         const { data, error } = await client.storage.from(bucket).download(targetThumbPath);
         if (data && !error) blob = data;
       } catch (_) {}
+    }
 
-      if (!blob) {
-        try {
-          const publicUrl = client.storage.from(bucket).getPublicUrl(targetThumbPath).data.publicUrl;
-          const res = await fetch(publicUrl);
-          if (res.ok) blob = await res.blob();
-        } catch (_) {}
-      }
+    // 3. Storage getPublicUrl fetch
+    if (!blob && targetThumbPath) {
+      try {
+        const publicUrl = client.storage.from(bucket).getPublicUrl(targetThumbPath).data.publicUrl;
+        const res = await fetch(publicUrl);
+        if (res.ok) blob = await res.blob();
+      } catch (_) {}
+    }
 
-      if (blob) {
-        const decrypted = await decryptBlob(blob, eventKey);
-        photo.decrypted_thumb_url = getCachedObjectURL(decrypted, `thumb_${photo.id || photo.filename}`);
-        photo.thumb_blob = decrypted;
-      }
+    if (blob) {
+      const decrypted = await decryptBlob(blob, eventKey);
+      photo.decrypted_thumb_url = getCachedObjectURL(decrypted, `thumb_${photo.id || photo.filename}`);
+      photo.thumb_blob = decrypted;
     }
 
     return photo;
@@ -1159,22 +1198,36 @@ export async function getDecryptedOriginalBlob(photo, key = '') {
   if (!photo) return null;
   if (photo.original_blob) return photo.original_blob;
 
-  const eventKey = (key || getStoredEventKey(photo.event_slug) || photo.encryption_key || '').trim();
+  const slug = photo.event_slug || '';
+  const eventKey = (key || getStoredEventKey(slug) || photo.encryption_key || '').trim();
 
   try {
     const client = getSupabaseClient();
     const { bucket } = getBaaSConfig();
-    const rawPath = photo.storage_orig_path || photo.storage_orig_url || photo.original_url || photo.storage_thumb_path || photo.storage_thumb_url || photo.thumb_url || photo.filename || '';
-    const targetPath = extractStoragePath(rawPath, bucket);
-    if (!targetPath) return null;
+    const directUrl = photo.storage_orig_url || photo.original_url || photo.storage_thumb_url || photo.thumb_url || '';
+    const rawPath = photo.storage_orig_path || photo.storage_thumb_path || photo.filename || '';
+    const targetPath = extractStoragePath(rawPath || directUrl, bucket);
 
     let blob = null;
-    try {
-      const { data, error } = await client.storage.from(bucket).download(targetPath);
-      if (data && !error) blob = data;
-    } catch (_) {}
 
-    if (!blob) {
+    // 1. Direct fetch if full URL is available
+    if (directUrl && directUrl.startsWith('http')) {
+      try {
+        const res = await fetch(directUrl);
+        if (res.ok) blob = await res.blob();
+      } catch (_) {}
+    }
+
+    // 2. Storage download
+    if (!blob && targetPath) {
+      try {
+        const { data, error } = await client.storage.from(bucket).download(targetPath);
+        if (data && !error) blob = data;
+      } catch (_) {}
+    }
+
+    // 3. Storage getPublicUrl fetch
+    if (!blob && targetPath) {
       try {
         const publicUrl = client.storage.from(bucket).getPublicUrl(targetPath).data.publicUrl;
         const res = await fetch(publicUrl);
@@ -1184,7 +1237,13 @@ export async function getDecryptedOriginalBlob(photo, key = '') {
 
     if (!blob) return null;
 
-    const isEnc = Boolean(targetPath.includes('.enc') || targetPath.includes('.lenc') || photo.is_encrypted || photo.encrypted);
+    const isEnc = Boolean(
+      (targetPath && (targetPath.includes('.enc') || targetPath.includes('.lenc'))) ||
+      (directUrl && (directUrl.includes('.enc') || directUrl.includes('.lenc'))) ||
+      photo.is_encrypted ||
+      photo.encrypted
+    );
+
     if (isEnc && eventKey) {
       const decrypted = await decryptBlob(blob, eventKey);
       photo.original_blob = decrypted;
