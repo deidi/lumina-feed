@@ -278,6 +278,9 @@
         key = matchedEvent.encryption_key;
       }
     }
+    if (!key && guestSession?.event?.encryption_key) {
+      key = guestSession.event.encryption_key;
+    }
     if (key && cleanSlug) {
       crypto.setStoredEventKey(cleanSlug, key);
     }
@@ -288,7 +291,15 @@
     if (!photo) return false;
     if (photo.is_encrypted === true || photo.encrypted === true) return true;
     const path = photo.storage_orig_path || photo.storage_thumb_path || photo.storage_orig_url || photo.storage_thumb_url || photo.original_url || photo.thumb_url || photo.filename || "";
-    return Boolean(path.includes(".enc") || path.includes(".lenc"));
+    if (path.includes(".enc") || path.includes(".lenc")) return true;
+    const slug = photo.event_slug || currentEventSlug || selectedEvent?.slug || guestEventData?.slug || "";
+    if (slug) {
+      const cleanSlug = String(slug).trim().toLowerCase();
+      if (crypto.getStoredEventKey(cleanSlug) || guestEventData?.is_encrypted || guestEventData?.e2ee_enabled || selectedEvent?.is_encrypted || selectedEvent?.e2ee_enabled) {
+        return true;
+      }
+    }
+    return false;
   }
 
   function triggerPhotosRefresh(photo) {
@@ -310,8 +321,10 @@
   function openPhotoPreview(photo) {
     if (!photo) return;
     selectedPreviewPhoto = { ...photo };
-    if (isPhotoEncrypted(photo)) {
-      const key = resolveEventDecryptionKey(photo);
+    const isEnc = isPhotoEncrypted(photo);
+    const key = resolveEventDecryptionKey(photo);
+
+    if (isEnc || key) {
       if (key) {
         if (!photo.decrypted_orig_url && !photo.original_blob && !photo._isDecryptingOrig) {
           photo._isDecryptingOrig = true;
@@ -358,20 +371,52 @@
 
   function getPhotoSrc(photo, isThumb = true) {
     if (!photo) return "";
-    if (typeof photo === "string") return photo;
-
-    const isEnc = isPhotoEncrypted(photo);
+    if (typeof photo === "string") {
+      if (photo.includes(".lenc") || photo.includes(".enc")) return "";
+      return photo;
+    }
 
     if (isThumb) {
-      if (photo.decrypted_thumb_url && !photo.decrypted_thumb_url.includes(".lenc")) return photo.decrypted_thumb_url;
-      if (photo.thumb_blob) return db.getCachedObjectURL(photo.thumb_blob, `thumb_${photo.id || photo.filename}`);
+      if (photo.decrypted_thumb_url && !photo.decrypted_thumb_url.includes(".lenc") && !photo.decrypted_thumb_url.includes(".enc")) {
+        return photo.decrypted_thumb_url;
+      }
+      if (photo.thumb_blob) {
+        const url = db.getCachedObjectURL(photo.thumb_blob, `thumb_${photo.id || photo.filename}`);
+        photo.decrypted_thumb_url = url;
+        return url;
+      }
       if (photo.thumbDataUrl) return photo.thumbDataUrl;
-      if (photo.decrypted_orig_url && !photo.decrypted_orig_url.includes(".lenc")) return photo.decrypted_orig_url;
-      if (photo.original_blob) return db.getCachedObjectURL(photo.original_blob, `orig_${photo.id || photo.filename}`);
+      if (photo.decrypted_orig_url && !photo.decrypted_orig_url.includes(".lenc") && !photo.decrypted_orig_url.includes(".enc")) {
+        return photo.decrypted_orig_url;
+      }
+      if (photo.original_blob) {
+        const url = db.getCachedObjectURL(photo.original_blob, `orig_${photo.id || photo.filename}`);
+        return url;
+      }
+    } else {
+      if (photo.decrypted_orig_url && !photo.decrypted_orig_url.includes(".lenc") && !photo.decrypted_orig_url.includes(".enc")) {
+        return photo.decrypted_orig_url;
+      }
+      if (photo.original_blob) {
+        const url = db.getCachedObjectURL(photo.original_blob, `orig_${photo.id || photo.filename}`);
+        photo.decrypted_orig_url = url;
+        return url;
+      }
+      if (photo.decrypted_thumb_url && !photo.decrypted_thumb_url.includes(".lenc") && !photo.decrypted_thumb_url.includes(".enc")) {
+        return photo.decrypted_thumb_url;
+      }
+      if (photo.thumb_blob) {
+        const url = db.getCachedObjectURL(photo.thumb_blob, `thumb_${photo.id || photo.filename}`);
+        return url;
+      }
+    }
 
-      if (isEnc) {
-        const key = resolveEventDecryptionKey(photo);
-        if (key && !photo._isDecryptingThumb) {
+    const isEnc = isPhotoEncrypted(photo);
+    const key = resolveEventDecryptionKey(photo);
+
+    if (isEnc || key) {
+      if (key) {
+        if (!photo.decrypted_thumb_url && !photo.thumb_blob && !photo._isDecryptingThumb) {
           photo._isDecryptingThumb = true;
           db.ensurePhotoDecrypted(photo, key).then((res) => {
             if (res && res.thumb_blob) {
@@ -385,24 +430,8 @@
             photo._isDecryptingThumb = false;
           });
         }
-        return "";
-      }
 
-      const rawThumbUrl = photo.storage_thumb_url || photo.thumb_url || photo.thumbnail_path || "";
-      const rawOrigUrl = photo.storage_orig_url || photo.original_url || photo.original_path || "";
-      return rawThumbUrl || rawOrigUrl;
-    }
-
-    // --- Full resolution original (Photo Preview & Slideshow) ---
-    if (photo.decrypted_orig_url && !photo.decrypted_orig_url.includes(".lenc")) return photo.decrypted_orig_url;
-    if (photo.original_blob) return db.getCachedObjectURL(photo.original_blob, `orig_${photo.id || photo.filename}`);
-    if (photo.decrypted_thumb_url && !photo.decrypted_thumb_url.includes(".lenc")) return photo.decrypted_thumb_url;
-    if (photo.thumb_blob) return db.getCachedObjectURL(photo.thumb_blob, `thumb_${photo.id || photo.filename}`);
-
-    if (isEnc) {
-      const key = resolveEventDecryptionKey(photo);
-      if (key) {
-        if (!photo.decrypted_orig_url && !photo._isDecryptingOrig) {
+        if (!isThumb && !photo.decrypted_orig_url && !photo.original_blob && !photo._isDecryptingOrig) {
           photo._isDecryptingOrig = true;
           db.getDecryptedOriginalBlob(photo, key).then((blob) => {
             if (blob) {
@@ -417,29 +446,26 @@
             photo._isDecryptingOrig = false;
           });
         }
-        if (!photo.decrypted_thumb_url && !photo._isDecryptingThumb) {
-          photo._isDecryptingThumb = true;
-          db.ensurePhotoDecrypted(photo, key).then((res) => {
-            if (res && res.thumb_blob) {
-              const url = db.getCachedObjectURL(res.thumb_blob, `thumb_${photo.id || photo.filename}`);
-              photo.decrypted_thumb_url = url;
-              photo.thumb_blob = res.thumb_blob;
-              photo._isDecryptingThumb = false;
-              triggerPhotosRefresh(photo);
-            }
-          }).catch(() => {
-            photo._isDecryptingThumb = false;
-          });
-        }
       }
-      // Return decrypted thumbnail if available while high-res original decrypts, or empty string so spinner displays
-      const validThumb = photo.decrypted_thumb_url && !photo.decrypted_thumb_url.includes(".lenc") ? photo.decrypted_thumb_url : "";
-      return validThumb || (photo.thumb_blob ? db.getCachedObjectURL(photo.thumb_blob, `thumb_${photo.id || photo.filename}`) : "") || "";
+
+      const validThumb = photo.decrypted_thumb_url && !photo.decrypted_thumb_url.includes(".lenc") && !photo.decrypted_thumb_url.includes(".enc")
+        ? photo.decrypted_thumb_url
+        : (photo.thumb_blob ? db.getCachedObjectURL(photo.thumb_blob, `thumb_${photo.id || photo.filename}`) : "");
+      
+      if (validThumb) return validThumb;
+      return "";
     }
 
     const rawOrigUrl = photo.storage_orig_url || photo.original_url || photo.original_path || "";
     const rawThumbUrl = photo.storage_thumb_url || photo.thumb_url || photo.thumbnail_path || "";
-    return rawOrigUrl || rawThumbUrl;
+
+    if (rawOrigUrl && (rawOrigUrl.includes(".lenc") || rawOrigUrl.includes(".enc"))) return "";
+    if (rawThumbUrl && (rawThumbUrl.includes(".lenc") || rawThumbUrl.includes(".enc"))) return "";
+
+    if (isThumb) {
+      return rawThumbUrl || rawOrigUrl || "";
+    }
+    return rawOrigUrl || rawThumbUrl || "";
   }
 
   async function decryptPhotosList(photosList) {
@@ -3521,108 +3547,96 @@
 
     isSlideshowSyncing = true;
     try {
-      // 1. Fetch current file listing from Supabase Storage bucket
-      const [bucketPhotos, cloudPhotoMetadata] = await Promise.all([
-        storage.listEventPhotosFromStorage(slug),
-        storage.getCloudPhotosForEvent(slug),
-      ]);
+      const cleanSlug = String(slug).trim().toLowerCase();
+      // 1. Fetch approved photos directly from Supabase Database
+      const res = await api.getPhotos(cleanSlug, { status: "approved" });
+      const approvedList = res.photos || [];
 
-      // 2. Fetch local approved photos for author/guest metadata cross-referencing
-      let localApproved = [];
-      try {
-        const localRes = await api.getPhotos(slug, { status: "approved" });
-        localApproved = localRes.photos || [];
-      } catch (e) {}
-
-      const localMap = new Map();
-      for (const p of localApproved) {
-        if (p.filename) localMap.set(p.filename, p);
-        if (p.storage_orig_path) localMap.set(p.storage_orig_path, p);
-        if (p.hash) localMap.set(p.hash, p);
+      // 2. Fetch event data if key is not yet in local storage
+      let key = resolveEventDecryptionKey(cleanSlug);
+      if (!key) {
+        try {
+          const eventRes = await api.getEvent(cleanSlug);
+          if (eventRes?.event) {
+            guestEventData = eventRes.event;
+            key = resolveEventDecryptionKey(cleanSlug) || eventRes.event.encryption_key || "";
+          }
+        } catch (_) {}
       }
 
-      const cloudMetadataMap = new Map();
-      for (const metadata of cloudPhotoMetadata || []) {
-        if (metadata.storage_orig_path) cloudMetadataMap.set(metadata.storage_orig_path, metadata);
-        if (metadata.filename) cloudMetadataMap.set(metadata.filename, metadata);
+      // 3. Map over existing slideshow photos to preserve already-decrypted URLs and blobs
+      const currentSlideshowMap = new Map();
+      for (const p of slideshowPhotos) {
+        if (p.storage_orig_path) currentSlideshowMap.set(p.storage_orig_path, p);
+        if (p.filename) currentSlideshowMap.set(p.filename, p);
+        if (p.id) currentSlideshowMap.set(p.id, p);
+        if (p.hash) currentSlideshowMap.set(p.hash, p);
       }
 
-      if (bucketPhotos) {
-        const bucketPathSet = new Set(bucketPhotos.map((p) => p.storage_orig_path).filter(Boolean));
-        const bucketFilenameSet = new Set(bucketPhotos.map((p) => p.filename).filter(Boolean));
+      const updatedList = approvedList.map((p) => {
+        const existing = currentSlideshowMap.get(p.storage_orig_path) ||
+                         currentSlideshowMap.get(p.filename) ||
+                         currentSlideshowMap.get(p.id) ||
+                         (p.hash ? currentSlideshowMap.get(p.hash) : null);
+        return {
+          ...p,
+          decrypted_thumb_url: existing?.decrypted_thumb_url || p.decrypted_thumb_url,
+          decrypted_orig_url: existing?.decrypted_orig_url || p.decrypted_orig_url,
+          thumb_blob: existing?.thumb_blob || p.thumb_blob,
+          original_blob: existing?.original_blob || p.original_blob,
+        };
+      });
 
-        // Reconcile:
-        // A. Start with bucketPhotos (authoritative source of cloud files)
-        const currentSlideshowMap = new Map();
-        for (const p of slideshowPhotos) {
-          if (p.storage_orig_path) currentSlideshowMap.set(p.storage_orig_path, p);
-          if (p.filename) currentSlideshowMap.set(p.filename, p);
-          if (p.id) currentSlideshowMap.set(p.id, p);
-        }
+      // 4. Compare fingerprints to check if photos changed
+      const currentFingerprint = slideshowPhotos.map((p) => p.storage_orig_path || p.filename || p.id).join("|");
+      const newFingerprint = updatedList.map((p) => p.storage_orig_path || p.filename || p.id).join("|");
 
-        const updatedList = bucketPhotos.map((bp) => {
-          const matched = localMap.get(bp.filename) || localMap.get(bp.storage_orig_path);
-          const metadata = cloudMetadataMap.get(bp.storage_orig_path) || cloudMetadataMap.get(bp.filename);
-          const existingSlide = currentSlideshowMap.get(bp.storage_orig_path) || currentSlideshowMap.get(bp.filename) || (bp.id ? currentSlideshowMap.get(bp.id) : null);
-          const localName = matched?.guest_name;
-          return {
-            ...bp,
-            guest_name: localName && localName !== "Guest" ? localName : metadata?.guest_name || localName || bp.guest_name || "Guest",
-            guest_id: matched?.guest_id || bp.guest_id || null,
-            guest_token: matched?.guest_token || metadata?.guest_token || null,
-            hash: matched?.hash || metadata?.hash || bp.hash || "",
-            decrypted_thumb_url: existingSlide?.decrypted_thumb_url || bp.decrypted_thumb_url,
-            decrypted_orig_url: existingSlide?.decrypted_orig_url || bp.decrypted_orig_url,
-            thumb_blob: existingSlide?.thumb_blob || bp.thumb_blob,
-            original_blob: existingSlide?.original_blob || bp.original_blob,
-          };
-        });
-
-        // B. Keep local-only approved photos that are not cloud-hosted (e.g. offline staged captures)
-        // BUT prune photos that were cloud-hosted in Supabase and now deleted from the bucket
-        for (const lp of localApproved) {
-          const isCloudHosted = Boolean(
-            lp.storage_orig_path ||
-            (lp.storage_orig_url && lp.storage_orig_url.includes("supabase")) ||
-            (lp.original_url && lp.original_url.includes("supabase"))
+      if (currentFingerprint !== newFingerprint || slideshowPhotos.length === 0) {
+        const currentPhoto = slideshowPhotos[currentSlideIndex];
+        if (currentPhoto) {
+          const preservedIdx = updatedList.findIndex(
+            (p) =>
+              (p.storage_orig_path && p.storage_orig_path === currentPhoto.storage_orig_path) ||
+              (p.filename && p.filename === currentPhoto.filename) ||
+              (p.id && p.id === currentPhoto.id)
           );
-          if (isCloudHosted) {
-            // Photo deleted from Supabase Storage -> do not include in slideshow
-            continue;
-          }
-          if (!bucketFilenameSet.has(lp.filename)) {
-            updatedList.push(lp);
+          if (preservedIdx !== -1) {
+            currentSlideIndex = preservedIdx;
+          } else {
+            currentSlideIndex = Math.max(0, Math.min(currentSlideIndex, updatedList.length - 1));
           }
         }
+        slideshowPhotos = updatedList;
+      }
 
-        // C. Check if the photo collection changed (new photos added or deleted photos removed)
-        const currentFingerprint = slideshowPhotos.map((p) => p.storage_orig_path || p.filename || p.id).join("|");
-        const newFingerprint = updatedList.map((p) => p.storage_orig_path || p.filename || p.id).join("|");
+      // 5. Decrypt thumbnails in background
+      decryptPhotosList(slideshowPhotos).then((p) => {
+        slideshowPhotos = p;
+      });
 
-        if (currentFingerprint !== newFingerprint) {
-          const currentPhoto = slideshowPhotos[currentSlideIndex];
-          if (currentPhoto) {
-            const preservedIdx = updatedList.findIndex(
-              (p) =>
-                (p.storage_orig_path && p.storage_orig_path === currentPhoto.storage_orig_path) ||
-                (p.filename && p.filename === currentPhoto.filename) ||
-                (p.id && p.id === currentPhoto.id)
-            );
-            if (preservedIdx !== -1) {
-              currentSlideIndex = preservedIdx;
-            } else {
-              currentSlideIndex = Math.max(0, Math.min(currentSlideIndex, updatedList.length - 1));
+      // 6. Pre-decrypt active slide original blob immediately
+      if (slideshowPhotos.length > 0 && key) {
+        const cur = slideshowPhotos[currentSlideIndex];
+        if (cur && isPhotoEncrypted(cur) && !cur.decrypted_orig_url && !cur.original_blob && !cur._isDecryptingOrig) {
+          cur._isDecryptingOrig = true;
+          db.getDecryptedOriginalBlob(cur, key).then((blob) => {
+            if (blob) {
+              const url = db.getCachedObjectURL(blob, `orig_${cur.id || cur.filename}`);
+              cur.decrypted_orig_url = url;
+              cur.original_blob = blob;
+              cur._isDecryptingOrig = false;
+              if (slideshowPhotos[currentSlideIndex]) {
+                slideshowPhotos[currentSlideIndex] = { ...cur };
+                slideshowPhotos = [...slideshowPhotos];
+              }
             }
-          }
-          slideshowPhotos = updatedList;
-          decryptPhotosList(updatedList).then((p) => {
-            slideshowPhotos = p;
-          });
+          }).catch(() => { cur._isDecryptingOrig = false; });
         }
       }
+
       lastCloudSyncTime = new Date();
     } catch (err) {
-      console.warn("Auto-sync from Supabase Storage bucket error:", err);
+      console.warn("Auto-sync slideshow photos error:", err);
     } finally {
       isSlideshowSyncing = false;
     }
@@ -3630,7 +3644,7 @@
 
   function startSlideshowAutoRefresh(slug) {
     stopSlideshowAutoRefresh();
-    // Auto-refresh from Supabase bucket every 5 seconds to show new captures and prune removed ones
+    // Auto-refresh approved photos every 5 seconds to show new approved captures and prune removed ones
     slideshowRefreshTimer = setInterval(() => {
       if (isSlideshowRoute && slug) {
         syncSlideshowFromSupabase(slug);
@@ -3647,29 +3661,51 @@
 
   async function loadSlideshowExperience(slug) {
     try {
+      const cleanSlug = String(slug).trim().toLowerCase();
       const [eventRes, photosRes, configRes] = await Promise.all([
-        api.getEvent(slug),
-        api.getPhotos(slug, { status: "approved" }),
-        api.getSlideshowConfig(slug),
+        api.getEvent(cleanSlug),
+        api.getPhotos(cleanSlug, { status: "approved" }),
+        api.getSlideshowConfig(cleanSlug),
       ]);
       guestEventData = eventRes.event;
-      if (guestEventData?.encryption_key && !crypto.getStoredEventKey(slug)) {
-        crypto.setStoredEventKey(slug, guestEventData.encryption_key);
+      const key = resolveEventDecryptionKey(cleanSlug) || guestEventData?.encryption_key || "";
+      if (key) {
+        crypto.setStoredEventKey(cleanSlug, key);
       }
       slideshowPhotos = photosRes.photos || [];
-      decryptPhotosList(slideshowPhotos).then((p) => {
-        slideshowPhotos = p;
-      });
-      slideshowConfig = configRes.config;
+      slideshowConfig = configRes.config || slideshowConfig;
       currentSlideIndex = 0;
       startSlideshowTimer();
 
-      // Immediately sync with Supabase Cloud Storage bucket
-      await syncSlideshowFromSupabase(slug);
+      // Decrypt thumbnails in background
+      decryptPhotosList(slideshowPhotos).then((p) => {
+        slideshowPhotos = p;
+      });
 
-      // Start auto-refresh polling interval to pick up new & removed pictures from Supabase bucket
-      startSlideshowAutoRefresh(slug);
+      // Decrypt active first slide original blob immediately
+      if (slideshowPhotos.length > 0 && key) {
+        const first = slideshowPhotos[0];
+        if (first && isPhotoEncrypted(first) && !first.decrypted_orig_url && !first.original_blob) {
+          first._isDecryptingOrig = true;
+          db.getDecryptedOriginalBlob(first, key).then((blob) => {
+            if (blob) {
+              const url = db.getCachedObjectURL(blob, `orig_${first.id || first.filename}`);
+              first.decrypted_orig_url = url;
+              first.original_blob = blob;
+              first._isDecryptingOrig = false;
+              if (slideshowPhotos[0]) {
+                slideshowPhotos[0] = { ...first };
+                slideshowPhotos = [...slideshowPhotos];
+              }
+            }
+          }).catch(() => { first._isDecryptingOrig = false; });
+        }
+      }
+
+      // Start auto-refresh polling interval
+      startSlideshowAutoRefresh(cleanSlug);
     } catch (err) {
+      console.error("loadSlideshowExperience error:", err);
       errorMsg = err.message || "Failed to load slideshow";
     }
   }
