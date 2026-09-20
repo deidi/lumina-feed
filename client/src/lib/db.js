@@ -968,7 +968,7 @@ export async function uploadPhoto(slug, file, guestToken, options = {}) {
   if (isStorageConfigured()) {
     uploadResult = await uploadPhotoToStorage({
       eventSlug: cleanSlug,
-      originalBlob: processed.blob,
+      originalBlob: processed.originalBlob || processed.blob,
       thumbBlob: processed.thumbBlob,
       filename: processed.filename,
       isEncrypted,
@@ -1027,7 +1027,7 @@ export async function uploadPhoto(slug, file, guestToken, options = {}) {
     },
     photo: {
       ...photoRecord,
-      original_blob: processed.blob,
+      original_blob: processed.originalBlob || processed.blob,
       thumb_blob: processed.thumbBlob,
       original_url: uploadResult?.origUrl || '',
       thumb_url: uploadResult?.thumbUrl || uploadResult?.origUrl || '',
@@ -1123,9 +1123,12 @@ function extractStoragePath(urlOrPath, bucket) {
 /**
  * Ensure photo decryption across E2EE events
  */
+/**
+ * Ensure photo decryption across E2EE events
+ */
 export async function ensurePhotoDecrypted(photo, key = '') {
   if (!photo) return photo;
-  if (photo.thumb_blob) {
+  if (photo.thumb_blob && photo.thumb_blob.size > 0) {
     if (!photo.decrypted_thumb_url || photo.decrypted_thumb_url.includes('.lenc') || photo.decrypted_thumb_url.includes('.enc')) {
       photo.decrypted_thumb_url = getCachedObjectURL(photo.thumb_blob, `thumb_${photo.id || photo.filename}`);
     }
@@ -1133,7 +1136,7 @@ export async function ensurePhotoDecrypted(photo, key = '') {
   }
 
   const slug = photo.event_slug || '';
-  const eventKey = (key || getStoredEventKey(slug) || photo.encryption_key || '').trim();
+  let eventKey = (key || getStoredEventKey(slug) || photo.encryption_key || '').trim();
   const directUrl = photo.storage_thumb_url || photo.thumb_url || photo.storage_orig_url || photo.original_url || '';
   const rawPath = photo.storage_thumb_path || photo.storage_orig_path || photo.filename || '';
 
@@ -1151,39 +1154,56 @@ export async function ensurePhotoDecrypted(photo, key = '') {
     if (directUrl && directUrl.startsWith('http')) {
       try {
         const res = await fetch(directUrl);
-        if (res.ok) blob = await res.blob();
+        if (res.ok) {
+          const b = await res.blob();
+          if (b && b.size > 0) blob = b;
+        }
       } catch (_) {}
     }
 
     // 2. Storage download
-    if (!blob && targetThumbPath) {
+    if ((!blob || blob.size === 0) && targetThumbPath) {
       try {
         const { data, error } = await client.storage.from(bucket).download(targetThumbPath);
-        if (data && !error) blob = data;
+        if (data && !error && data.size > 0) blob = data;
       } catch (_) {}
     }
 
     // 3. Storage getPublicUrl fetch
-    if (!blob && targetThumbPath) {
+    if ((!blob || blob.size === 0) && targetThumbPath) {
       try {
         const publicUrl = client.storage.from(bucket).getPublicUrl(targetThumbPath).data.publicUrl;
         const res = await fetch(publicUrl);
-        if (res.ok) blob = await res.blob();
+        if (res.ok) {
+          const b = await res.blob();
+          if (b && b.size > 0) blob = b;
+        }
       } catch (_) {}
     }
 
-    if (blob) {
+    if (blob && blob.size > 0) {
       let isEnc = false;
       try {
         const slice = await blob.slice(0, 16).arrayBuffer();
         isEnc = isEncryptedBuffer(slice);
       } catch (_) {}
 
-      if (isEnc && eventKey) {
-        const decrypted = await decryptBlob(blob, eventKey);
-        photo.decrypted_thumb_url = getCachedObjectURL(decrypted, `thumb_${photo.id || photo.filename}`);
-        photo.thumb_blob = decrypted;
-      } else if (!isEnc) {
+      if (isEnc) {
+        if (!eventKey && slug) {
+          try {
+            const manifest = await getEventManifestFromStorage(slug);
+            if (manifest?.encryption_key) {
+              eventKey = manifest.encryption_key.trim();
+              setStoredEventKey(slug, eventKey);
+            }
+          } catch (_) {}
+        }
+        if (eventKey) {
+          const decrypted = await decryptBlob(blob, eventKey);
+          photo.decrypted_thumb_url = getCachedObjectURL(decrypted, `thumb_${photo.id || photo.filename}`);
+          photo.thumb_blob = decrypted;
+        }
+      } else {
         photo.decrypted_thumb_url = getCachedObjectURL(blob, `thumb_${photo.id || photo.filename}`);
         photo.thumb_blob = blob;
       }
@@ -1201,10 +1221,10 @@ export async function ensurePhotoDecrypted(photo, key = '') {
  */
 export async function getDecryptedOriginalBlob(photo, key = '') {
   if (!photo) return null;
-  if (photo.original_blob) return photo.original_blob;
+  if (photo.original_blob && photo.original_blob.size > 0) return photo.original_blob;
 
   const slug = photo.event_slug || '';
-  const eventKey = (key || getStoredEventKey(slug) || photo.encryption_key || '').trim();
+  let eventKey = (key || getStoredEventKey(slug) || photo.encryption_key || '').trim();
 
   try {
     const client = getSupabaseClient();
@@ -1222,29 +1242,35 @@ export async function getDecryptedOriginalBlob(photo, key = '') {
     if (directUrl && directUrl.startsWith('http')) {
       try {
         const res = await fetch(directUrl);
-        if (res.ok) blob = await res.blob();
+        if (res.ok) {
+          const b = await res.blob();
+          if (b && b.size > 0) blob = b;
+        }
       } catch (_) {}
     }
 
     // 2. Storage download
-    if (!blob && targetPath) {
+    if ((!blob || blob.size === 0) && targetPath) {
       try {
         const { data, error } = await client.storage.from(bucket).download(targetPath);
-        if (data && !error) blob = data;
+        if (data && !error && data.size > 0) blob = data;
       } catch (_) {}
     }
 
     // 3. Storage getPublicUrl fetch
-    if (!blob && targetPath) {
+    if ((!blob || blob.size === 0) && targetPath) {
       try {
         const publicUrl = client.storage.from(bucket).getPublicUrl(targetPath).data.publicUrl;
         const res = await fetch(publicUrl);
-        if (res.ok) blob = await res.blob();
+        if (res.ok) {
+          const b = await res.blob();
+          if (b && b.size > 0) blob = b;
+        }
       } catch (_) {}
     }
 
-    // 4. Thumbnail fallback if original download failed
-    if (!blob) {
+    // 4. Thumbnail fallback if original download failed or was 0 bytes
+    if (!blob || blob.size === 0) {
       const thumbUrl = photo.storage_thumb_url || photo.thumb_url || '';
       const rawThumbPath = photo.storage_thumb_path || '';
       let targetThumb = extractStoragePath(rawThumbPath || thumbUrl, bucket);
@@ -1254,37 +1280,40 @@ export async function getDecryptedOriginalBlob(photo, key = '') {
       if (thumbUrl && thumbUrl.startsWith('http')) {
         try {
           const res = await fetch(thumbUrl);
-          if (res.ok) blob = await res.blob();
+          if (res.ok) {
+            const b = await res.blob();
+            if (b && b.size > 0) blob = b;
+          }
         } catch (_) {}
       }
-      if (!blob && targetThumb) {
+      if ((!blob || blob.size === 0) && targetThumb) {
         try {
           const { data, error } = await client.storage.from(bucket).download(targetThumb);
-          if (data && !error) blob = data;
+          if (data && !error && data.size > 0) blob = data;
         } catch (_) {}
       }
     }
 
-    if (!blob) return null;
-
-    let isEnc = Boolean(
-      (targetPath && (targetPath.includes('.enc') || targetPath.includes('.lenc'))) ||
-      (directUrl && (directUrl.includes('.enc') || directUrl.includes('.lenc'))) ||
-      photo.is_encrypted ||
-      photo.encrypted
-    );
+    if (!blob || blob.size === 0) return null;
 
     // Verify magic bytes to distinguish real encrypted ciphertext from plain images
+    let isEnc = false;
     try {
       const slice = await blob.slice(0, 16).arrayBuffer();
-      if (isEncryptedBuffer(slice)) {
-        isEnc = true;
-      } else {
-        isEnc = false;
-      }
+      isEnc = isEncryptedBuffer(slice);
     } catch (_) {}
 
     if (isEnc) {
+      if (!eventKey && slug) {
+        try {
+          const manifest = await getEventManifestFromStorage(slug);
+          if (manifest?.encryption_key) {
+            eventKey = manifest.encryption_key.trim();
+            setStoredEventKey(slug, eventKey);
+          }
+        } catch (_) {}
+      }
+
       if (eventKey) {
         try {
           const decrypted = await decryptBlob(blob, eventKey);
@@ -1318,14 +1347,26 @@ export async function downloadAndCachePhotoBlob(photo, key = '') {
   if (photo.decrypted_orig_url && !photo.decrypted_orig_url.includes('.lenc') && !photo.decrypted_orig_url.includes('.enc')) {
     return photo.decrypted_orig_url;
   }
-  if (photo.original_blob) {
+  if (photo.original_blob && photo.original_blob.size > 0) {
     const url = getCachedObjectURL(photo.original_blob, `orig_${photo.id || photo.filename}`);
     photo.decrypted_orig_url = url;
     return url;
   }
 
-  const blob = await getDecryptedOriginalBlob(photo, key);
-  if (blob) {
+  const slug = photo.event_slug || '';
+  let eventKey = (key || getStoredEventKey(slug) || photo.encryption_key || '').trim();
+  if (!eventKey && slug) {
+    try {
+      const manifest = await getEventManifestFromStorage(slug);
+      if (manifest?.encryption_key) {
+        eventKey = manifest.encryption_key.trim();
+        setStoredEventKey(slug, eventKey);
+      }
+    } catch (_) {}
+  }
+
+  const blob = await getDecryptedOriginalBlob(photo, eventKey);
+  if (blob && blob.size > 0) {
     const url = getCachedObjectURL(blob, `orig_${photo.id || photo.filename}`);
     photo.original_blob = blob;
     photo.decrypted_orig_url = url;
@@ -1333,10 +1374,16 @@ export async function downloadAndCachePhotoBlob(photo, key = '') {
     return url;
   }
 
-  // Fallback to thumbnail blob if original is unreachable
-  if (photo.thumb_blob) {
+  // Fallback to thumbnail blob if original is unreachable or 0-bytes
+  if (!photo.thumb_blob || photo.thumb_blob.size === 0) {
+    await ensurePhotoDecrypted(photo, eventKey);
+  }
+
+  if (photo.thumb_blob && photo.thumb_blob.size > 0) {
     const url = getCachedObjectURL(photo.thumb_blob, `thumb_${photo.id || photo.filename}`);
     photo.decrypted_orig_url = url;
+    photo.original_blob = photo.thumb_blob;
+    photo._isDownloaded = true;
     return url;
   }
 

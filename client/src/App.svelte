@@ -3593,6 +3593,17 @@
           }
         } catch (_) {}
       }
+      if (!key) {
+        try {
+          const manifest = await db.getEventManifestFromStorage(cleanSlug);
+          if (manifest?.encryption_key) {
+            key = manifest.encryption_key.trim();
+          }
+        } catch (_) {}
+      }
+      if (key) {
+        crypto.setStoredEventKey(cleanSlug, key);
+      }
 
       // 3. Map over existing slideshow photos to preserve already-decrypted URLs and blobs
       const currentSlideshowMap = new Map();
@@ -3681,7 +3692,16 @@
         api.getSlideshowConfig(cleanSlug),
       ]);
       guestEventData = eventRes.event;
-      const key = resolveEventDecryptionKey(cleanSlug) || guestEventData?.encryption_key || "";
+      let key = resolveEventDecryptionKey(cleanSlug) || guestEventData?.encryption_key || "";
+      if (!key) {
+        try {
+          const manifest = await db.getEventManifestFromStorage(cleanSlug);
+          if (manifest?.encryption_key) {
+            key = manifest.encryption_key.trim();
+            guestEventData.encryption_key = key;
+          }
+        } catch (_) {}
+      }
       if (key) {
         crypto.setStoredEventKey(cleanSlug, key);
       }

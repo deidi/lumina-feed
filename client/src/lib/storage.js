@@ -564,7 +564,7 @@ export async function uploadPhotoToStorage({
   filename,
   origBlob,
   originalBlob,
-  thumbBlob,
+  blob,
   mimeType = 'image/jpeg',
   encryptionKey = '',
   caption = '',
@@ -601,16 +601,27 @@ export async function uploadPhotoToStorage({
   const key = (encryptionKey || getStoredEventKey(eventSlug) || '').trim();
   const isEncrypted = Boolean(key);
 
-  let rawOrigBlob = origBlob || originalBlob;
+  let rawOrigBlob = origBlob || originalBlob || blob;
   let rawThumbBlob = thumbBlob;
+
+  if ((!rawOrigBlob || rawOrigBlob.size === 0) && rawThumbBlob && rawThumbBlob.size > 0) {
+    rawOrigBlob = rawThumbBlob;
+  }
+  if ((!rawThumbBlob || rawThumbBlob.size === 0) && rawOrigBlob && rawOrigBlob.size > 0) {
+    rawThumbBlob = rawOrigBlob;
+  }
+
+  if (!rawOrigBlob || rawOrigBlob.size === 0) {
+    throw new Error('Photo blob is empty or missing');
+  }
 
   let finalOrigBlob = rawOrigBlob;
   let finalThumbBlob = rawThumbBlob;
 
-  if (isEncrypted && rawOrigBlob) {
+  if (isEncrypted && rawOrigBlob && rawOrigBlob.size > 0) {
     try {
       finalOrigBlob = await encryptBlob(rawOrigBlob, key);
-      if (rawThumbBlob) {
+      if (rawThumbBlob && rawThumbBlob.size > 0) {
         finalThumbBlob = await encryptBlob(rawThumbBlob, key);
       }
     } catch (encErr) {
