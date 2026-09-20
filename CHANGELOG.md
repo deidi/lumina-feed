@@ -5,6 +5,19 @@ All notable changes to the **LuminaFeed** project rebuild will be documented in 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-09-20
+
+### Added
+- **Supabase Bring-Your-Own-Key (BYOK) Setup**: Hosts can now provide their own Supabase backend credentials (`Project URL`, `Public Anon Key`, and `Storage Bucket Name`) directly from the Host Dashboard storage settings modal.
+- **Fail-Safe Default Cloud Reset**: Added a 1-click fail-safe reset mechanism (`handleResetToDefaultStorage` / `resetToDefaultBaaS`) that immediately restores the application to the default managed Supabase Cloud backend with masked credentials.
+- **1-Click SQL Setup Script Generator**: Hosts configuring a custom Supabase project can copy an idempotent, hardened SQL initialization script that automatically creates all database tables (`hosts`, `events`, `guests`, `photos`), Row-Level Security policies, and storage bucket MIME/size restrictions.
+- **Custom Backend Dashboard Indicator**: The Host Dashboard storage status badge dynamically reflects whether the host is running in `Managed` or `Custom (BYOK)` cloud mode.
+
+### Changed
+- **Zero-Exposure Credential Masking**: Default Supabase credentials remain securely masked (`https://••••••••••••••••••••.supabase.co` and `••••••••••••••••••••••••••••••••`) in all user-facing dialogs, ensuring API keys are never leaked or rendered in plaintext inputs during default operation.
+
+---
+
 ## [0.3.0] - 2026-09-20
 
 ### Added

@@ -207,29 +207,68 @@ create index if not exists idx_photos_event_status on public.photos(event_slug, 
 create index if not exists idx_photos_guest_token on public.photos(event_slug, guest_token);
 create index if not exists idx_photos_path on public.photos(storage_orig_path);
 
--- 7. Row Level Security Policies (Anon Permissive)
+-- 7. Enable Row Level Security (RLS)
 alter table public.hosts enable row level security;
 alter table public.events enable row level security;
 alter table public.guests enable row level security;
 alter table public.photos enable row level security;
 
+-- Row Level Security Policies for Anon Key (Active 24-hour records only)
 drop policy if exists "Allow all actions for anon on hosts" on public.hosts;
-create policy "Allow all actions for anon on hosts" on public.hosts for all using (true) with check (true);
+drop policy if exists "Anon read active hosts" on public.hosts;
+drop policy if exists "Anon insert hosts" on public.hosts;
+drop policy if exists "Anon update hosts" on public.hosts;
+drop policy if exists "Anon delete hosts" on public.hosts;
+
+create policy "Anon read active hosts" on public.hosts
+  for select using (expires_at > now());
+
+create policy "Anon insert hosts" on public.hosts
+  for insert with check (expires_at > now());
+
+create policy "Anon update hosts" on public.hosts
+  for update using (expires_at > now()) with check (expires_at > now());
+
+create policy "Anon delete hosts" on public.hosts
+  for delete using (true);
 
 drop policy if exists "Allow all actions for anon on events" on public.events;
-create policy "Allow all actions for anon on events" on public.events for all using (true) with check (true);
+drop policy if exists "Anon read active events" on public.events;
+drop policy if exists "Anon mutate events" on public.events;
+
+create policy "Anon read active events" on public.events
+  for select using (expires_at > now());
+
+create policy "Anon mutate events" on public.events
+  for all using (expires_at > now()) with check (expires_at > now());
 
 drop policy if exists "Allow all actions for anon on guests" on public.guests;
-create policy "Allow all actions for anon on guests" on public.guests for all using (true) with check (true);
+drop policy if exists "Anon access guests" on public.guests;
+
+create policy "Anon access guests" on public.guests
+  for all using (true) with check (true);
 
 drop policy if exists "Allow all actions for anon on photos" on public.photos;
-create policy "Allow all actions for anon on photos" on public.photos for all using (true) with check (true);
+drop policy if exists "Anon access photos" on public.photos;
 
--- 8. Storage Bucket Setup & Policies
-insert into storage.buckets (id, name, public)
-values ('luminafeed-photos', 'luminafeed-photos', true)
-on conflict (id) do update set public = true;
+create policy "Anon access photos" on public.photos
+  for all using (true) with check (true);
 
+-- 8. Storage Bucket Setup (luminafeed-photos) with Quota & MIME Constraints
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values (
+  'luminafeed-photos',
+  'luminafeed-photos',
+  true,
+  5242880,
+  array['image/jpeg', 'image/png', 'application/octet-stream']
+)
+on conflict (id) do update set
+  public = true,
+  file_size_limit = 5242880,
+  allowed_mime_types = array['image/jpeg', 'image/png', 'application/octet-stream'];
+
+-- Storage RLS Policies for Anon Key
 drop policy if exists "Public Access for luminafeed-photos" on storage.objects;
 create policy "Public Access for luminafeed-photos" on storage.objects
   for all using (bucket_id = 'luminafeed-photos') with check (bucket_id = 'luminafeed-photos');

@@ -1,7 +1,7 @@
 # 📸 LuminaFeed — Real-Time Event Photo Sharing PWA
 
-[![Version](https://img.shields.io/badge/Version-v0.3.0-blue)](CHANGELOG.md)
-[![Target](https://img.shields.io/badge/Latest%20Release-v0.3.0%20Production-orange)](#-rebuild-roadmap-v001--v100)
+[![Version](https://img.shields.io/badge/Version-v0.3.1-blue)](CHANGELOG.md)
+[![Target](https://img.shields.io/badge/Latest%20Release-v0.3.1%20Production-orange)](#-rebuild-roadmap-v001--v100)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 [![Frontend](https://img.shields.io/badge/Frontend-Svelte%205%20%2B%20Vite%206-FF3E00?logo=svelte)](https://svelte.dev/)
 [![BaaS](https://img.shields.io/badge/BaaS-Supabase%20Storage%20%26%20Postgres-3ECF8E?logo=supabase)](https://supabase.com/)
@@ -161,6 +161,7 @@ Designed to operate comfortably within Supabase's **1 GB Free Tier**:
 | **Phase 12** | `v0.2.1` | **Unified Login Baseline & Schema-Adaptive Persistence** | ✅ **Completed** |
 | **Phase 13** | `v0.2.2` | **Event Status Default & Quota Hardening** | ✅ **Completed** |
 | **Phase 14** | `v0.3.0` | **Comprehensive Security Hardening, CSPRNG Tokens & RLS** | ✅ **Completed** |
+| **Phase 15** | `v0.3.1` | **Supabase BYOK Custom Setup & Fail-Safe Cloud Reset** | ✅ **Completed** |
 
 ---
 

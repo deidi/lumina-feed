@@ -2065,20 +2065,53 @@
     }
   }
 
-  // --- SUPABASE CLOUD STORAGE STATE ---
+  // --- SUPABASE CLOUD STORAGE & BYOK BACKEND STATE ---
   let isStorageModalOpen = $state(false);
   let isStorageConfigured = $state(storage.isStorageConfigured());
+  let currentBaaSConfig = $state(storage.getBaaSConfig());
+  let storageSetupTab = $state(storage.getBaaSConfig().isCustom ? "custom" : "default"); // "default" | "custom"
+  let customSupabaseUrl = $state(localStorage.getItem('luminafeed_custom_supabase_url') || "");
+  let customSupabaseAnonKey = $state(localStorage.getItem('luminafeed_custom_supabase_anon_key') || "");
+  let customSupabaseBucket = $state(localStorage.getItem('luminafeed_custom_supabase_bucket') || "luminafeed-photos");
   let isTestingStorage = $state(false);
   let storageTestResult = $state(null);
+  let isSavingCustomStorage = $state(false);
+  let sqlCopied = $state(false);
+
+  function openStorageSettingsModal() {
+    currentBaaSConfig = storage.getBaaSConfig();
+    storageSetupTab = currentBaaSConfig.isCustom ? "custom" : "default";
+    customSupabaseUrl = localStorage.getItem('luminafeed_custom_supabase_url') || "";
+    customSupabaseAnonKey = localStorage.getItem('luminafeed_custom_supabase_anon_key') || "";
+    customSupabaseBucket = localStorage.getItem('luminafeed_custom_supabase_bucket') || "luminafeed-photos";
+    storageTestResult = null;
+    isStorageModalOpen = true;
+  }
 
   async function handleTestStorageConnection() {
     isTestingStorage = true;
     storageTestResult = null;
     try {
-      const res = await storage.testStorageConnection(8000);
+      let probe = null;
+      if (storageSetupTab === "custom") {
+        if (!customSupabaseUrl.trim() || !customSupabaseAnonKey.trim()) {
+          storageTestResult = {
+            success: false,
+            message: "⚠️ Please enter your Supabase Project URL and Public Anon Key before testing.",
+          };
+          isTestingStorage = false;
+          return;
+        }
+        probe = {
+          url: customSupabaseUrl.trim(),
+          anonKey: customSupabaseAnonKey.trim(),
+          bucket: (customSupabaseBucket || 'luminafeed-photos').trim(),
+        };
+      }
+      const res = await storage.testStorageConnection(probe, 8000);
       storageTestResult = {
-        success: true,
-        message: "⚡ Connected to Supabase Cloud Storage successfully!",
+        success: res.ok,
+        message: res.message,
       };
     } catch (err) {
       storageTestResult = {
@@ -2088,6 +2121,68 @@
     } finally {
       isTestingStorage = false;
     }
+  }
+
+  async function handleSaveCustomStorage() {
+    if (!customSupabaseUrl.trim() || !customSupabaseAnonKey.trim()) {
+      alert("Please enter both your Supabase Project URL and Public Anon Key.");
+      return;
+    }
+    if (!customSupabaseUrl.trim().startsWith("http://") && !customSupabaseUrl.trim().startsWith("https://")) {
+      alert("Project URL must start with https:// or http://");
+      return;
+    }
+
+    isSavingCustomStorage = true;
+    storageTestResult = null;
+    try {
+      storage.setCustomBaaSConfig({
+        url: customSupabaseUrl.trim(),
+        anonKey: customSupabaseAnonKey.trim(),
+        bucket: (customSupabaseBucket || 'luminafeed-photos').trim(),
+      });
+      currentBaaSConfig = storage.getBaaSConfig();
+      isStorageConfigured = storage.isStorageConfigured();
+      storageSetupTab = "custom";
+      
+      const res = await storage.testStorageConnection(null, 8000);
+      storageTestResult = {
+        success: res.ok,
+        message: res.ok ? "⚡ Custom Supabase configuration saved and verified successfully!" : res.message,
+      };
+      await loadEvents();
+    } catch (err) {
+      storageTestResult = {
+        success: false,
+        message: "⚠️ Failed to save configuration: " + err.message,
+      };
+    } finally {
+      isSavingCustomStorage = false;
+    }
+  }
+
+  async function handleResetToDefaultStorage() {
+    storage.resetToDefaultBaaS();
+    currentBaaSConfig = storage.getBaaSConfig();
+    isStorageConfigured = storage.isStorageConfigured();
+    storageSetupTab = "default";
+    customSupabaseUrl = "";
+    customSupabaseAnonKey = "";
+    customSupabaseBucket = "luminafeed-photos";
+    storageTestResult = {
+      success: true,
+      message: "🛡️ Fail-safe activated: Successfully restored to default managed Supabase Cloud backend!",
+    };
+    try {
+      await loadEvents();
+    } catch (_) {}
+  }
+
+  function handleCopySQLScript() {
+    const script = storage.get1ClickSQLSetupScript(customSupabaseBucket || 'luminafeed-photos');
+    navigator.clipboard.writeText(script);
+    sqlCopied = true;
+    setTimeout(() => (sqlCopied = false), 3000);
   }
 
   // --- GOOGLE DRIVE 1-CLICK OAUTH & ZIP EXPORTS (Optional Secondary Backup) ---
@@ -5180,17 +5275,17 @@
           <div style="display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap;">
             {#if isStorageConfigured}
               <button
-                class="status-pill pill-approved"
-                style="cursor: pointer; border: none; font-size: 0.875rem;"
-                onclick={() => (isStorageModalOpen = true)}
-                title="Configure Cloud Storage Settings"
+                class="status-pill"
+                style="cursor: pointer; border: {currentBaaSConfig.isCustom ? '1px solid rgba(99, 102, 241, 0.4)' : '1px solid rgba(16, 185, 129, 0.4)'}; background: {currentBaaSConfig.isCustom ? 'rgba(99, 102, 241, 0.12)' : 'rgba(16, 185, 129, 0.12)'}; color: {currentBaaSConfig.isCustom ? '#818cf8' : '#10b981'}; font-size: 0.875rem;"
+                onclick={openStorageSettingsModal}
+                title="Configure Supabase Cloud Storage (Default vs Custom BYOK)"
               >
-                ⚡ Supabase Cloud Storage: Active ⚙️
+                ⚡ Supabase Cloud: <strong>{currentBaaSConfig.isCustom ? 'Custom (BYOK)' : 'Managed'}</strong> ⚙️
               </button>
             {:else}
               <button
                 class="btn-secondary btn-sm"
-                onclick={() => (isStorageModalOpen = true)}
+                onclick={openStorageSettingsModal}
                 title="Configure Supabase Cloud Storage"
               >
                 ⚙️ Setup Cloud Storage
@@ -5240,7 +5335,7 @@
               <button
                 class="btn-primary"
                 style="background: #2563eb; border-color: #2563eb; padding: 0.75rem 1.5rem; font-size: 1rem; font-weight: 700; white-space: nowrap;"
-                onclick={() => (isStorageModalOpen = true)}
+                onclick={openStorageSettingsModal}
               >
                 <span>⚙️</span> Configure Storage
               </button>
@@ -7259,40 +7354,176 @@
     >
       <!-- svelte-ignore a11y_click_events_have_key_events -->
       <!-- svelte-ignore a11y_no_static_element_interactions -->
-      <div class="modal-card" style="max-width: 580px;" onclick={(e) => e.stopPropagation()}>
+      <div class="modal-card" style="max-width: 620px;" onclick={(e) => e.stopPropagation()}>
         <div class="modal-header">
           <div style="display: flex; align-items: center; gap: 0.5rem;">
             <span style="font-size: 1.5rem;">⚡</span>
             <div>
-              <h3 style="margin: 0;">Supabase Cloud Storage</h3>
-              <span class="text-secondary" style="font-size: 0.8125rem;">Direct-to-Cloud Uploads & High-Speed CDN Delivery</span>
+              <h3 style="margin: 0;">Supabase Cloud Backend</h3>
+              <span class="text-secondary" style="font-size: 0.8125rem;">Storage Bucket, Direct CDN & Database Configuration</span>
             </div>
           </div>
           <button class="close-btn" onclick={() => (isStorageModalOpen = false)}>&times;</button>
         </div>
 
         <div class="form-stack">
-          <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: var(--radius-md); padding: 1.25rem;">
-            <div style="display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.5rem;">
-              <span style="font-size: 1.75rem;">🚀</span>
-              <div>
-                <strong style="font-size: 0.9375rem;">Ultra-Fast Direct Photo Storage</strong>
-                <p class="text-secondary" style="margin: 0.25rem 0 0 0; font-size: 0.8125rem; line-height: 1.4;">
-                  Guests upload photos directly to your Supabase bucket. Photos stream instantly to your moderation queue and live TV wall via Supabase CDN.
-                </p>
+          <!-- Setup Mode Tabs -->
+          <div style="display: flex; gap: 0.5rem; background: var(--color-surface); padding: 0.25rem; border-radius: var(--radius-md); border: 1px solid var(--color-border);">
+            <button
+              type="button"
+              class="btn-secondary"
+              style="flex: 1; padding: 0.5rem; font-size: 0.8125rem; font-weight: {storageSetupTab === 'default' ? '700' : '400'}; background: {storageSetupTab === 'default' ? 'var(--color-primary)' : 'transparent'}; color: {storageSetupTab === 'default' ? 'white' : 'var(--color-text)'}; border: none;"
+              onclick={() => { storageSetupTab = 'default'; storageTestResult = null; }}
+            >
+              ☁️ Managed Cloud (Default)
+            </button>
+            <button
+              type="button"
+              class="btn-secondary"
+              style="flex: 1; padding: 0.5rem; font-size: 0.8125rem; font-weight: {storageSetupTab === 'custom' ? '700' : '400'}; background: {storageSetupTab === 'custom' ? 'var(--color-primary)' : 'transparent'}; color: {storageSetupTab === 'custom' ? 'white' : 'var(--color-text)'}; border: none;"
+              onclick={() => { storageSetupTab = 'custom'; storageTestResult = null; }}
+            >
+              🛠️ Use My Own Setup (BYOK)
+            </button>
+          </div>
+
+          <!-- TAB 1: DEFAULT MANAGED CLOUD -->
+          {#if storageSetupTab === 'default'}
+            <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: var(--radius-md); padding: 1.25rem;">
+              <div style="display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.75rem;">
+                <span style="font-size: 1.75rem;">🚀</span>
+                <div>
+                  <strong style="font-size: 0.9375rem;">Pre-Configured Managed Supabase Cloud</strong>
+                  <p class="text-secondary" style="margin: 0.25rem 0 0 0; font-size: 0.8125rem; line-height: 1.4;">
+                    Zero setup required. Photo uploads, moderation queues, and real-time feeds are served through the pre-configured LuminaFeed cloud backend.
+                  </p>
+                </div>
+              </div>
+
+              <!-- Masked Configuration Details -->
+              <div style="background: var(--color-bg); border: 1px solid var(--color-border); border-radius: var(--radius-sm); padding: 0.875rem; margin-top: 0.75rem; font-size: 0.8125rem;">
+                <div style="display: flex; justify-content: space-between; margin-bottom: 0.35rem;">
+                  <span class="text-secondary">Project URL:</span>
+                  <span style="font-family: monospace; color: var(--color-text);">https://••••••••••••••••••••.supabase.co</span>
+                </div>
+                <div style="display: flex; justify-content: space-between; margin-bottom: 0.35rem;">
+                  <span class="text-secondary">Public Anon Key:</span>
+                  <span style="font-family: monospace; color: var(--color-text);">••••••••••••••••••••••••••••••••</span>
+                </div>
+                <div style="display: flex; justify-content: space-between; margin-bottom: 0.35rem;">
+                  <span class="text-secondary">Storage Bucket:</span>
+                  <span style="font-family: monospace; color: var(--color-text);">luminafeed-photos</span>
+                </div>
+                <div style="display: flex; justify-content: space-between;">
+                  <span class="text-secondary">Lifecycle Retention:</span>
+                  <span style="color: #10b981; font-weight: 500;">24h Ephemeral Auto-Purge Active</span>
+                </div>
+              </div>
+
+              <div style="display: flex; align-items: center; gap: 0.5rem; margin-top: 0.875rem; font-size: 0.775rem; color: #10b981;">
+                <span>🔒</span>
+                <span>Default credentials remain securely masked and protected.</span>
               </div>
             </div>
 
-            <div style="display: flex; align-items: flex-start; gap: 0.5rem; margin-top: 0.75rem; padding-top: 0.75rem; border-top: 1px solid var(--color-border); font-size: 0.8125rem; color: var(--color-text-secondary); line-height: 1.5;">
-              <span style="display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #10b981; margin-top: 5px; flex-shrink: 0;"></span>
-              <div>
-                <span style="color: var(--color-text); font-weight: 500;">Environment Configuration Active</span>
-                <p style="margin: 0.25rem 0 0 0; font-size: 0.775rem;">
-                  All Supabase API credentials and bucket configurations are securely managed via your environment variables.
-                </p>
+            {#if currentBaaSConfig.isCustom}
+              <div style="background: rgba(99, 102, 241, 0.08); border: 1px solid rgba(99, 102, 241, 0.3); border-radius: var(--radius-md); padding: 1rem; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.75rem;">
+                <div>
+                  <strong style="font-size: 0.875rem; color: #818cf8;">Custom Setup Currently Active</strong>
+                  <p class="text-secondary" style="margin: 0.25rem 0 0 0; font-size: 0.8rem;">
+                    You are currently using custom Supabase credentials. Click below to return to the default cloud backend.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  class="btn-secondary btn-sm"
+                  style="border-color: #818cf8; color: #818cf8; font-weight: 600;"
+                  onclick={handleResetToDefaultStorage}
+                >
+                  🛡️ Use Default Setup (Fail-Safe)
+                </button>
+              </div>
+            {/if}
+
+          <!-- TAB 2: CUSTOM SETUP (BYOK) -->
+          {:else}
+            <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: var(--radius-md); padding: 1.25rem;">
+              <div style="display: flex; align-items: center; gap: 0.75rem; margin-bottom: 1rem;">
+                <span style="font-size: 1.75rem;">🛠️</span>
+                <div>
+                  <strong style="font-size: 0.9375rem;">Bring Your Own Supabase Backend</strong>
+                  <p class="text-secondary" style="margin: 0.25rem 0 0 0; font-size: 0.8125rem; line-height: 1.4;">
+                    Connect your own Supabase project for complete data ownership, unlimited storage quotas, and private PostgreSQL instances.
+                  </p>
+                </div>
+              </div>
+
+              <!-- Input Form -->
+              <div class="form-stack" style="gap: 0.875rem;">
+                <div>
+                  <label for="custom-supabase-url" style="display: block; font-size: 0.8125rem; font-weight: 600; margin-bottom: 0.35rem;">
+                    Supabase Project URL <span style="color: #ef4444;">*</span>
+                  </label>
+                  <input
+                    id="custom-supabase-url"
+                    type="url"
+                    class="form-control"
+                    placeholder="https://your-project-id.supabase.co"
+                    bind:value={customSupabaseUrl}
+                    style="width: 100%; font-family: monospace; font-size: 0.8125rem;"
+                  />
+                </div>
+
+                <div>
+                  <label for="custom-supabase-anon-key" style="display: block; font-size: 0.8125rem; font-weight: 600; margin-bottom: 0.35rem;">
+                    Supabase Public Anon Key <span style="color: #ef4444;">*</span>
+                  </label>
+                  <input
+                    id="custom-supabase-anon-key"
+                    type="password"
+                    class="form-control"
+                    placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+                    bind:value={customSupabaseAnonKey}
+                    style="width: 100%; font-family: monospace; font-size: 0.8125rem;"
+                  />
+                </div>
+
+                <div>
+                  <label for="custom-supabase-bucket" style="display: block; font-size: 0.8125rem; font-weight: 600; margin-bottom: 0.35rem;">
+                    Storage Bucket Name
+                  </label>
+                  <input
+                    id="custom-supabase-bucket"
+                    type="text"
+                    class="form-control"
+                    placeholder="luminafeed-photos"
+                    bind:value={customSupabaseBucket}
+                    style="width: 100%; font-family: monospace; font-size: 0.8125rem;"
+                  />
+                </div>
+              </div>
+
+              <!-- 1-Click SQL Setup Script Helper -->
+              <div style="margin-top: 1rem; padding: 0.875rem; background: var(--color-bg); border: 1px dashed var(--color-border); border-radius: var(--radius-sm);">
+                <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.5rem;">
+                  <div>
+                    <strong style="font-size: 0.8125rem;">📋 Initializing a fresh Supabase project?</strong>
+                    <p class="text-secondary" style="margin: 0.15rem 0 0 0; font-size: 0.775rem;">
+                      Copy our 1-click SQL script to create tables (`hosts`, `events`, `guests`, `photos`) and storage policies.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    class="btn-secondary btn-sm"
+                    onclick={handleCopySQLScript}
+                    style="font-size: 0.75rem;"
+                  >
+                    {sqlCopied ? "✅ Copied SQL!" : "📋 Copy 1-Click SQL"}
+                  </button>
+                </div>
               </div>
             </div>
-          </div>
+          {/if}
 
           {#if storageTestResult}
             <div class={storageTestResult.success ? "alert-success" : "alert-error"} style="margin-top: 0.5rem; font-size: 0.875rem;">
@@ -7300,19 +7531,45 @@
             </div>
           {/if}
 
+          <!-- Modal Action Footer -->
           <div class="modal-footer" style="margin-top: 1rem; justify-content: space-between; flex-wrap: wrap; gap: 0.5rem;">
-            <button
-              type="button"
-              class="btn-secondary"
-              disabled={isTestingStorage}
-              onclick={handleTestStorageConnection}
-            >
-              {isTestingStorage ? "Testing..." : "🧪 Test Connection"}
-            </button>
-            <div style="display: flex; gap: 0.5rem;">
+            <div style="display: flex; gap: 0.5rem; flex-wrap: wrap;">
               <button
                 type="button"
-                class="btn-primary"
+                class="btn-secondary"
+                disabled={isTestingStorage}
+                onclick={handleTestStorageConnection}
+              >
+                {isTestingStorage ? "Testing..." : "🧪 Test Connection"}
+              </button>
+
+              {#if storageSetupTab === 'custom' || currentBaaSConfig.isCustom}
+                <button
+                  type="button"
+                  class="btn-secondary"
+                  onclick={handleResetToDefaultStorage}
+                  title="Reset to default managed Supabase configuration"
+                  style="border-color: rgba(239, 68, 68, 0.4); color: #ef4444;"
+                >
+                  🛡️ Use Default Setup (Fail-Safe)
+                </button>
+              {/if}
+            </div>
+
+            <div style="display: flex; gap: 0.5rem;">
+              {#if storageSetupTab === 'custom'}
+                <button
+                  type="button"
+                  class="btn-primary"
+                  disabled={isSavingCustomStorage}
+                  onclick={handleSaveCustomStorage}
+                >
+                  {isSavingCustomStorage ? "Saving..." : "💾 Save & Connect Setup"}
+                </button>
+              {/if}
+              <button
+                type="button"
+                class={storageSetupTab === 'custom' ? "btn-secondary" : "btn-primary"}
                 onclick={() => (isStorageModalOpen = false)}
               >
                 Close
