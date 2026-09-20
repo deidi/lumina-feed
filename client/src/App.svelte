@@ -279,7 +279,6 @@
 
   function isPhotoEncrypted(photo) {
     if (!photo) return false;
-    if (photo.is_encrypted || photo.e2ee_enabled) return true;
     const path = photo.storage_orig_path || photo.storage_thumb_path || photo.storage_orig_url || photo.storage_thumb_url || photo.original_url || photo.thumb_url || photo.filename || "";
     return Boolean(path.includes(".enc") || path.includes(".lenc"));
   }
@@ -306,10 +305,10 @@
 
     if (isThumb) {
       if (photo.decrypted_thumb_url) return photo.decrypted_thumb_url;
-      if (photo.thumb_blob) return db.getCachedObjectURL(photo.thumb_blob, `thumb_${photo.id}`);
+      if (photo.thumb_blob) return db.getCachedObjectURL(photo.thumb_blob, `thumb_${photo.id || photo.filename}`);
       if (photo.thumbDataUrl) return photo.thumbDataUrl;
       if (photo.decrypted_orig_url) return photo.decrypted_orig_url;
-      if (photo.original_blob) return db.getCachedObjectURL(photo.original_blob, `orig_${photo.id}`);
+      if (photo.original_blob) return db.getCachedObjectURL(photo.original_blob, `orig_${photo.id || photo.filename}`);
 
       const rawThumbUrl = photo.storage_thumb_url || photo.thumb_url || photo.thumbnail_path || "";
       const rawOrigUrl = photo.storage_orig_url || photo.original_url || photo.original_path || "";
@@ -321,7 +320,7 @@
           photo._isDecryptingThumb = true;
           db.ensurePhotoDecrypted(photo, key).then((res) => {
             if (res && res.thumb_blob) {
-              const url = db.getCachedObjectURL(res.thumb_blob, `thumb_${photo.id}`);
+              const url = db.getCachedObjectURL(res.thumb_blob, `thumb_${photo.id || photo.filename}`);
               photo.decrypted_thumb_url = url;
               triggerPhotosRefresh(photo);
             }
@@ -335,9 +334,9 @@
 
     // Full resolution original
     if (photo.decrypted_orig_url) return photo.decrypted_orig_url;
-    if (photo.original_blob) return db.getCachedObjectURL(photo.original_blob, `orig_${photo.id}`);
+    if (photo.original_blob) return db.getCachedObjectURL(photo.original_blob, `orig_${photo.id || photo.filename}`);
     if (photo.decrypted_thumb_url) return photo.decrypted_thumb_url;
-    if (photo.thumb_blob) return db.getCachedObjectURL(photo.thumb_blob, `thumb_${photo.id}`);
+    if (photo.thumb_blob) return db.getCachedObjectURL(photo.thumb_blob, `thumb_${photo.id || photo.filename}`);
 
     const rawOrigUrl = photo.storage_orig_url || photo.original_url || photo.original_path || "";
     const rawThumbUrl = photo.storage_thumb_url || photo.thumb_url || photo.thumbnail_path || "";
@@ -360,14 +359,14 @@
           photo._isDecryptingThumb = true;
           db.ensurePhotoDecrypted(photo, key).then((res) => {
             if (res && res.thumb_blob) {
-              const url = db.getCachedObjectURL(res.thumb_blob, `thumb_${photo.id}`);
+              const url = db.getCachedObjectURL(res.thumb_blob, `thumb_${photo.id || photo.filename}`);
               photo.decrypted_thumb_url = url;
               triggerPhotosRefresh(photo);
             }
           }).catch(() => {});
         }
       }
-      return photo.decrypted_thumb_url || (photo.thumb_blob ? db.getCachedObjectURL(photo.thumb_blob, `thumb_${photo.id}`) : "") || "";
+      return photo.decrypted_thumb_url || (photo.thumb_blob ? db.getCachedObjectURL(photo.thumb_blob, `thumb_${photo.id || photo.filename}`) : "") || "";
     }
 
     return primaryUrl;
@@ -383,7 +382,7 @@
       photosList.map(async (p) => {
         if (p.decrypted_thumb_url) return p;
         if (p.thumb_blob) {
-          const url = db.getCachedObjectURL(p.thumb_blob, `thumb_${p.id}`);
+          const url = db.getCachedObjectURL(p.thumb_blob, `thumb_${p.id || p.filename}`);
           hasUpdates = true;
           return { ...p, decrypted_thumb_url: url };
         }
